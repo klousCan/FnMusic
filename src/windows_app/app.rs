@@ -169,6 +169,7 @@ pub struct MusicApp {
     playlist_pending: HashSet<String>,
     panel: Panel,
     lyrics_detail: bool,
+    detail_lyrics_enabled: bool,
     covers: HashMap<String, Cover>,
     cover_limit: Arc<Semaphore>,
     cover_clock: u64,
@@ -673,6 +674,7 @@ impl MusicApp {
             playlist_pending: HashSet::new(),
             panel: Panel::None,
             lyrics_detail: false,
+            detail_lyrics_enabled: true,
             covers: HashMap::new(),
             cover_limit: Arc::new(Semaphore::new(3)),
             cover_clock: 0,
@@ -2518,86 +2520,130 @@ impl MusicApp {
                     ctx.request_repaint();
                 }
                 ui.add_space(18.0);
-                ui.columns(2, |columns| {
-                    columns[0].vertical(|ui| {
-                        // Keep the entire transport group on screen. In a
-                        // short window the old cover cap consumed the space
-                        // reserved for progress and volume controls.
-                        let size = (ui.available_width() - 42.0)
-                            .min(ui.available_height() - 286.0)
-                            .clamp(112.0, 480.0);
-                        ui.set_width(size);
-                        self.art(ui, &track.cover, &track.title, size);
-                        ui.add_space(18.0);
-                        ui.horizontal(|ui| {
-                            ui.allocate_ui_with_layout(
-                                Vec2::new((size - 86.0).max(80.0), 32.0),
-                                Layout::left_to_right(Align::Center),
-                                |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&track.title).size(24.0).strong(),
-                                        )
-                                        .truncate(),
-                                    );
-                                },
-                            );
-                            self.favorite_button(ui, &track);
-                            ui.menu_button("···", |ui| {
-                                if ui.button("添加到播放列表末尾").clicked() {
-                                    self.add_to_queue(track.clone(), false);
-                                    ui.close_menu();
-                                }
+                let has_lyrics = self.lyrics.iter().any(|line| !line.text.trim().is_empty());
+                let show_lyrics = self.detail_lyrics_enabled && has_lyrics;
+                ui.columns(if show_lyrics { 2 } else { 1 }, |columns| {
+                    let available = columns[0].available_rect_before_wrap();
+                    let size = (available.width() - 42.0)
+                        .min(available.height() - 286.0)
+                        .clamp(112.0, 480.0);
+                    let left = if show_lyrics {
+                        available.left()
+                    } else {
+                        available.center().x - size * 0.5
+                    };
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(left, available.top()),
+                        Vec2::new(size, available.height()),
+                    );
+                    columns[0].scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(rect)
+                            .layout(Layout::top_down(Align::Min)),
+                        |ui| {
+                            // Keep the entire transport group on screen. In a
+                            // short window the old cover cap consumed the space
+                            // reserved for progress and volume controls.
+                            ui.set_width(size);
+                            self.art(ui, &track.cover, &track.title, size);
+                            ui.add_space(18.0);
+                            ui.horizontal(|ui| {
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new((size - 86.0).max(80.0), 32.0),
+                                    Layout::left_to_right(Align::Center),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&track.title).size(24.0).strong(),
+                                            )
+                                            .truncate(),
+                                        );
+                                    },
+                                );
+                                self.favorite_button(ui, &track);
+                                ui.menu_button("···", |ui| {
+                                    if ui.button("添加到播放列表末尾").clicked() {
+                                        self.add_to_queue(track.clone(), false);
+                                        ui.close_menu();
+                                    }
+                                });
                             });
-                        });
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&track.artist)
-                                    .size(17.0)
-                                    .color(Color32::from_white_alpha(180)),
-                            )
-                            .truncate(),
-                        );
-                        ui.add_space(12.0);
-                        self.detail_progress(ui, &track, size);
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = ((size - 172.0) / 4.0).max(3.0);
-                            self.transport_controls(ui);
-                        });
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            let muted = self.queue.volume == 0.0;
-                            let (icon, label) = if muted {
-                                (Icon::Mute, "取消静音")
-                            } else {
-                                (Icon::Volume, "静音")
-                            };
-                            if icons::small(ui, icon, label, false).clicked() {
-                                if muted {
-                                    self.set_volume(self.volume_before_mute);
-                                } else {
-                                    self.volume_before_mute = self.queue.volume;
-                                    self.set_volume(0.0);
-                                }
-                            }
-                            let mut volume = self.queue.volume;
-                            if playback_slider(ui, (size * 0.48).clamp(72.0, 200.0), false, |ui| {
-                                ui.add(
-                                    egui::Slider::new(&mut volume, 0.0..=1.0)
-                                        .show_value(false)
-                                        .trailing_fill(true),
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&track.artist)
+                                        .size(17.0)
+                                        .color(Color32::from_white_alpha(180)),
                                 )
-                            })
-                            .changed()
-                            {
-                                self.set_volume(volume);
-                            }
-                        });
-                    });
-                    let lyrics = &mut columns[1];
-                    lyrics.add_space(28.0);
-                    self.lyrics_detail_lines(lyrics);
+                                .truncate(),
+                            );
+                            ui.add_space(12.0);
+                            self.detail_progress(ui, &track, size);
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = ((size - 172.0) / 4.0).max(3.0);
+                                self.transport_controls(ui);
+                            });
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                let muted = self.queue.volume == 0.0;
+                                let (icon, label) = if muted {
+                                    (Icon::Mute, "取消静音")
+                                } else {
+                                    (Icon::Volume, "静音")
+                                };
+                                if icons::small(ui, icon, label, false).clicked() {
+                                    if muted {
+                                        self.set_volume(self.volume_before_mute);
+                                    } else {
+                                        self.volume_before_mute = self.queue.volume;
+                                        self.set_volume(0.0);
+                                    }
+                                }
+                                let mut volume = self.queue.volume;
+                                if playback_slider(
+                                    ui,
+                                    (size * 0.48).clamp(72.0, 200.0),
+                                    false,
+                                    |ui| {
+                                        ui.add(
+                                            egui::Slider::new(&mut volume, 0.0..=1.0)
+                                                .show_value(false)
+                                                .trailing_fill(true),
+                                        )
+                                    },
+                                )
+                                .changed()
+                                {
+                                    self.set_volume(volume);
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui
+                                        .add_enabled(
+                                            has_lyrics,
+                                            egui::Button::new("歌词")
+                                                .selected(self.detail_lyrics_enabled && has_lyrics)
+                                                .corner_radius(12),
+                                        )
+                                        .on_hover_text(if has_lyrics {
+                                            "显示或隐藏歌词"
+                                        } else {
+                                            "这首歌曲暂无歌词"
+                                        })
+                                        .clicked()
+                                    {
+                                        self.detail_lyrics_enabled = !self.detail_lyrics_enabled;
+                                        self.last_lyric = None;
+                                        ctx.request_repaint();
+                                    }
+                                });
+                            });
+                        },
+                    );
+                    if show_lyrics {
+                        let lyrics = &mut columns[1];
+                        lyrics.add_space(28.0);
+                        self.lyrics_detail_lines(lyrics);
+                    }
                 });
             });
     }

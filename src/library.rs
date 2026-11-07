@@ -180,6 +180,9 @@ fn number<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<u64, D:
 }
 
 fn cover_id(raw: &str) -> &str {
+    if raw.len() == 32 && raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return raw;
+    }
     raw.split_once('_')
         .filter(|(kind, id)| {
             matches!(*kind, "album" | "artist" | "track")
@@ -330,10 +333,52 @@ async fn tracks(
     cover: &str,
 ) -> Result<Listing> {
     let (list, has_more) = rows::<RawTrack>(session, path, query, page, size).await?;
-    let tracks = list
-        .into_iter()
-        .filter_map(|item| item.map(cover))
-        .collect();
+    let mut tracks = Vec::new();
+    let mut missing = Vec::new();
+    for item in list {
+        let album_id = item
+            .album
+            .as_ref()
+            .map(|album| album.guid.clone())
+            .unwrap_or_default();
+        if let Some(track) = item.map(cover) {
+            if track.cover.is_empty() && !album_id.is_empty() {
+                missing.push((tracks.len(), album_id));
+            }
+            tracks.push(track);
+        }
+    }
+    // Playlist responses can contain a track GUID as coverId and omit the
+    // album cover. Resolve only missing artwork, once per album in this page.
+    if !missing.is_empty() {
+        use futures_util::{StreamExt, stream};
+        let ids: std::collections::HashSet<_> = missing.iter().map(|(_, id)| id.clone()).collect();
+        let covers: std::collections::HashMap<_, _> = stream::iter(ids)
+            .map(|id| async move {
+                let album = session
+                    .json::<RawEntity>(
+                        Method::GET,
+                        "/api/v1/album/detail",
+                        &[("albumGUID", id.as_str())],
+                        None,
+                    )
+                    .await;
+                let cover = album
+                    .ok()
+                    .flatten()
+                    .map(|album| cover_id(&album.cover_id).to_owned())
+                    .unwrap_or_default();
+                (id, cover)
+            })
+            .buffer_unordered(3)
+            .collect()
+            .await;
+        for (index, id) in missing {
+            if let Some(cover) = covers.get(&id) {
+                tracks[index].cover = cover.clone();
+            }
+        }
+    }
     Ok(Listing {
         tracks,
         has_more,
@@ -577,6 +622,11 @@ mod tests {
 
     #[test]
     fn maps_numeric_guids_and_duration_and_skips_invalid_covers() {
+        assert_eq!(
+            cover_id("e03fb3795678482bae1ddd87bb0d40aa"),
+            "e03fb3795678482bae1ddd87bb0d40aa"
+        );
+        assert_eq!(cover_id("https://example.com/cover"), "");
         let raw = serde_json::from_str::<RawTrack>(
             r#"{
             "guid":42,"title":"晴天","duration":"185000","coverId":"012345",

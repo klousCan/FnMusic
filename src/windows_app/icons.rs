@@ -165,12 +165,7 @@ pub fn button(
 }
 
 pub fn window_icon() -> Option<egui::IconData> {
-    let image = super::artwork::decode(br##"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
-      <rect x="2" y="2" width="60" height="60" rx="15" fill="#df3158"/>
-      <path d="M29 43V22l17-4v20M29 27l17-4" fill="none" stroke="white" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
-      <ellipse cx="24" cy="44" rx="7" ry="5.5" fill="white"/>
-      <ellipse cx="41" cy="39" rx="7" ry="5.5" fill="white"/>
-    </svg>"##)?;
+    let image = super::artwork::decode(include_bytes!("../../assets/icon.png"))?;
     Some(egui::IconData {
         rgba: image
             .pixels

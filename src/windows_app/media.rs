@@ -196,6 +196,26 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a signed-in NAS session; prints artwork metadata only"]
+    fn inspect_playlist_artwork() {
+        let root = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap()).join("FnMusic");
+        let credentials = super::super::vault::acceptance_credentials(&root).unwrap();
+        let session = Session::new(Api::new().unwrap(), credentials, Box::new(ReadOnlySession));
+        Runtime::new().unwrap().block_on(async {
+            let playlists = library::load(&session, &Page::Playlists, 1).await.unwrap();
+            let id = &playlists.playlists[0].id;
+            let data = session.json::<serde_json::Value>(reqwest::Method::GET, "/api/v1/track/playlist-detail/list", &[("playlistGUID", id), ("page", "1"), ("size", "2")], None).await.unwrap().unwrap();
+            for item in data["list"].as_array().unwrap() {
+                let raw = item["coverId"].as_str().unwrap();
+                for candidate in [raw.to_owned(), format!("album_{raw}")] {
+                    println!("COVER {} {:?}", candidate, session.cover(&candidate, "160").await.map(|bytes| bytes.len()));
+                }
+                println!("ARTWORK {}", serde_json::json!({"keys":item.as_object().unwrap().keys().collect::<Vec<_>>(), "coverId":item["coverId"], "album":item["album"]}));
+            }
+        });
+    }
+
+    #[test]
     #[ignore = "requires a signed-in NAS session in FNMUSIC_ACCEPTANCE_DATA_DIR"]
     fn real_nas_flac() {
         unsafe {

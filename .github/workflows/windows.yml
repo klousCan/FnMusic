@@ -76,4 +76,3 @@ jobs:
           else
             gh release create preview dist/* --target "$BUILD_SHA" --title "FnMusic 最新预览版" --notes "$notes" --prerelease
           fi
-
