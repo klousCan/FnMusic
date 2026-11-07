@@ -1,0 +1,6 @@
+/target/
+/.local/
+/dist/
+/.env
+/.env.*
+*.log
