@@ -1,0 +1,68 @@
+# 飞牛音乐 · FnMusic
+
+FnMusic 是面向 Windows 10 22H2 和 Windows 11 x64 的第三方飞牛音乐桌面客户端。主窗口使用 Rust 和 egui，Windows MediaPlayer 负责音频解码与输出。WebView2 用于打开飞牛官方 NAS 账号授权页。
+
+## 使用
+
+1. 在飞牛 NAS 上启用飞牛音乐，并确保当前 Windows 电脑能够访问服务。
+2. 启动 `fnmusic.exe`，填写 NAS 地址，例如 `192.168.1.10:5666` 或 `https://nas.example.com`。可以填写带反向代理前缀或 `/music` 的地址。
+3. 选择「使用 NAS 账号登录」，在弹出的飞牛官方页面完成授权。使用 HTTPS 自签名证书时，请先把对应的 CA 导入 Windows 信任库，并使用证书上的主机名访问。
+4. 从首页或资料库打开专辑、艺人和歌单，点击歌曲开始播放。使用 `Ctrl+F` 定位搜索框，使用空格键控制播放。点击底部的封面、歌名或艺人可打开歌词详情，按 `Esc` 返回资料库。点击带时间戳的歌词可跳到对应位置。
+
+侧边栏在窗口宽度低于 980 个逻辑点时自动折叠。较宽的窗口可用 `Ctrl+B` 切换侧栏。在宽度低于 1240 个逻辑点时，歌词和队列面板以浮层打开。导航栏按钮、`Alt+←` / `Alt+→` 和鼠标侧键均可前进或后退，并恢复已加载页面的滚动位置。
+
+歌曲列表支持点击列头对已加载歌曲排序。单击选择，`Ctrl` 多选，`Shift` 连选，`↑` / `↓` 移动选中行，双击或按 `Enter` 播放。右键或点行尾的更多图标可批量加入队列或收藏。也可以把选中的歌曲拖到侧栏的「喜欢的歌曲」，或拖到展开侧栏中的具体歌单。
+
+播放栏中央提供播放／暂停主按钮，两侧排列随机、切歌和循环。右侧提供音质菜单、播放列表和音量控制；进度条悬停可预览时间。源文件音质信息来自 NAS 元数据。音质档位请求是否生效取决于 NAS 接口支持，目前尚未验证服务器转码能力。账户菜单中的「外观与主题色」可选择浅色、深色或跟随系统，并切换经典红、墨绿或海蓝。
+
+关闭窗口默认留在系统托盘并继续播放。单击托盘图标显示窗口，右键菜单可播放／暂停、切歌或退出。再次启动同一数据目录下的应用会唤醒已有窗口。侧栏底部的头像账户菜单可设置「关闭窗口时 → 直接退出应用」，也可分别「退出登录」或「退出飞牛音乐」。托盘菜单中的关闭选项与账户菜单同步，重启后保留。
+
+Windows 媒体面板和键盘媒体键可控制播放／暂停、上一首、下一首；媒体面板显示歌名、艺人、专辑和播放进度，支持跳转。窗口标题和托盘提示跟随当前歌曲。系统托盘初始化失败时，关闭窗口会正常退出，避免应用隐藏后无法找回。
+
+退出并重新启动应用后，队列、位置和音量会按服务器和账号恢复，等待手动开始播放。默认数据目录为 `%LOCALAPPDATA%\FnMusic`，其中会话文件使用当前 Windows 用户的 DPAPI 加密。退出登录会清除会话凭证和该授权窗口的浏览数据，并清除系统媒体信息。
+
+## 从源码构建
+
+需要 Windows x64、Rust stable MSVC 工具链、Visual Studio 的「使用 C++ 的桌面开发」构建工具与 Windows SDK。运行应用需要 Microsoft Edge WebView2 Runtime 和 Windows 媒体组件。Windows N 版可从系统设置添加 Media Feature Pack。
+
+```powershell
+rustup default stable-x86_64-pc-windows-msvc
+cargo build --release --locked
+cargo test --locked
+```
+
+Release 文件位于 `target\release\fnmusic.exe`。调试时可使用 `cargo run --locked`。
+
+## GitHub 自动打包
+
+提交到 `main`、提交 Pull Request 或手动运行 Actions 中的 `Windows build and package`，将执行格式检查、测试和 Windows x64 Release 构建。成功后可在运行记录的 Artifacts 下载便携 ZIP 和 SHA-256 校验文件。包内含程序、说明和许可证；运行仍需要 WebView2 Runtime。
+
+推送 `v` 开头的版本标签（例如 `v0.1.0`）将执行同样检查，并自动创建 GitHub Release、上传 ZIP 和校验文件。流水线仅在发布任务中获得仓库内容写权限，不需要额外配置访问令牌。首次云端构建结果以 GitHub Actions 运行记录为准。
+
+## 使用模拟服务器联调
+
+在 [上游项目](https://github.com/Raduap/FN-Music-Apple) 目录运行 `npm run mock`，或者直接用 Node.js 运行上游的 `dev/mock-server.js`。在 FnMusic 中填写 `127.0.0.1:5666`，在模拟授权页输入任意测试值。`FNMUSIC_DATA_DIR` 可为联调指定独立的数据目录。模拟服务器提供 WAV 音频、SVG 封面和带时间戳的歌词。
+
+```powershell
+cargo test --locked --test protocol upstream_mock_contract -- --ignored
+```
+
+如模拟服务使用其他端口，设置 `FNMUSIC_MOCK_URL`，并使用本机地址。桌面验收时依次检查 NAS 授权、浏览、中文搜索、收藏、切歌、进度跳转、歌词跳转、关闭后恢复和退出登录。
+
+也可以用 `node .\tests\mock-upstream.cjs <上游 dev/mock-server.js 的路径>` 启动自动授权的回环测试服务。在另一个 PowerShell 中运行客户端流程测试。
+
+```powershell
+$env:FNMUSIC_DATA_DIR = Join-Path $env:TEMP ('FnMusic-test-' + [guid]::NewGuid())
+cargo test --locked --bin fnmusic mock_app_playback_restore_and_logout -- --ignored
+```
+
+## 验证记录
+
+- Windows 11 x64 已构建并启动 Release。WebView2 回归测试覆盖授权窗口与主窗口共存、回调捕获、浏览数据清除。
+- Windows 原生系统集成测试已验证托盘创建、系统媒体会话的暂停／跳转／下一首回调，以及真实 eframe 窗口关闭后隐藏、第二次启动唤醒、切换设置后直接退出。模拟 NAS 回归另覆盖系统播放命令、动态标题和关闭设置重启恢复。
+- 上游模拟服务已验证中文搜索、收藏、播放、歌词跳转、重启后暂停恢复和退出登录。Windows 原生播放器另用 WAV、MP3、AAC/M4A 和 FLAC 样本验证了播放与跳转。
+- 真实 NAS 的飞牛音乐版本为 1.0.10。已在官方授权窗口完成登录，并使用该会话通过客户端的音频转发播放一首 FLAC，跳转到第 4 秒。Windows 10 22H2 的实机验证待进行。
+
+## 上游参考
+
+飞牛音乐的 API 兼容实现参考 [FN-Music-Apple](https://github.com/Raduap/FN-Music-Apple) 的授权、签名和 API 映射。该项目采用 [MIT 许可](LICENSE)。

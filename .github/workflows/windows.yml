@@ -1,0 +1,58 @@
+name: Windows build and package
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust MSVC
+        run: rustup toolchain install stable --profile minimal --component rustfmt
+      - name: Check formatting
+        run: cargo +stable fmt --check
+      - name: Test
+        run: cargo +stable test --locked
+      - name: Build Windows x64
+        run: cargo +stable build --release --locked --target x86_64-pc-windows-msvc
+      - name: Package portable application
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist/FnMusic -Force | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/fnmusic.exe dist/FnMusic/
+          Copy-Item README.md,LICENSE,THIRD_PARTY_NOTICES.md dist/FnMusic/
+          Compress-Archive -Path dist/FnMusic -DestinationPath dist/FnMusic-windows-x64.zip
+          $hash = (Get-FileHash dist/FnMusic-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  FnMusic-windows-x64.zip" | Set-Content dist/SHA256SUMS.txt -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FnMusic-windows-x64
+          path: |
+            dist/FnMusic-windows-x64.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: FnMusic-windows-x64
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" dist/* --title "FnMusic $RELEASE_TAG" --generate-notes
