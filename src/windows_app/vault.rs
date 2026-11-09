@@ -47,9 +47,18 @@ pub enum Accent {
     Blue,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnimationMode {
+    On,
+    System,
+    Off,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Preferences {
+    pub animation_mode: AnimationMode,
     pub close_to_tray: bool,
     pub color_mode: ColorMode,
     pub accent: Accent,
@@ -60,6 +69,7 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
+            animation_mode: AnimationMode::On,
             close_to_tray: true,
             color_mode: ColorMode::System,
             accent: Accent::Red,

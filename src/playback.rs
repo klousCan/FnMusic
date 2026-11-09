@@ -31,6 +31,7 @@ pub struct Queue {
     pub repeat: Repeat,
     pub position_ms: u64,
     pub volume: f32,
+    pub clear_after_playback: bool,
 }
 
 impl Default for Queue {
@@ -43,11 +44,19 @@ impl Default for Queue {
             repeat: Repeat::Off,
             position_ms: 0,
             volume: 0.8,
+            clear_after_playback: false,
         }
     }
 }
 
 impl Queue {
+    pub fn clear(&mut self) {
+        self.tracks.clear();
+        self.order.clear();
+        self.current = None;
+        self.position_ms = 0;
+    }
+
     pub fn restore(&mut self) {
         let mut sorted = self.order.clone();
         sorted.sort_unstable();
@@ -211,6 +220,9 @@ impl Queue {
             self.select(next);
             true
         } else {
+            if natural_end && self.clear_after_playback {
+                self.clear();
+            }
             false
         }
     }
@@ -302,6 +314,45 @@ pub fn active_lyric(lines: &[LyricLine], ms: u64) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_after_playback_waits_for_natural_end_and_preserves_settings() {
+        let mut queue = Queue {
+            clear_after_playback: true,
+            volume: 0.35,
+            ..Default::default()
+        };
+        queue.replace(
+            vec![
+                Track {
+                    id: "a".into(),
+                    ..Default::default()
+                },
+                Track {
+                    id: "b".into(),
+                    ..Default::default()
+                },
+            ],
+            0,
+        );
+        assert!(queue.next(true));
+        assert!(!queue.next(false));
+        assert_eq!(queue.current().unwrap().id, "b");
+        let mut restored: Queue =
+            serde_json::from_str(&serde_json::to_string(&queue).unwrap()).unwrap();
+        restored.restore();
+        assert!(restored.clear_after_playback);
+        assert!(!restored.next(true));
+        assert!(restored.current().is_none());
+        assert_eq!(restored.entries().count(), 0);
+        assert_eq!(restored.volume, 0.35);
+        assert!(restored.clear_after_playback);
+        assert!(
+            !serde_json::from_str::<Queue>("{}")
+                .unwrap()
+                .clear_after_playback
+        );
+    }
 
     #[test]
     fn lrc_offsets_repeated_tags_and_translations() {

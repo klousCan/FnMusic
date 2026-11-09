@@ -1,11 +1,14 @@
 mod app;
 mod artwork;
 mod desktop;
+mod experience;
 mod icons;
 mod media;
+mod motion;
 mod oauth;
 mod track_table;
 mod vault;
+mod widgets;
 
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily, ViewportBuilder};
 
@@ -19,7 +22,8 @@ pub fn run() -> eframe::Result {
         media::Apartment::new().map_err(|err| eframe::Error::AppCreation(Box::new(err)))?;
     let mut viewport = ViewportBuilder::default()
         .with_inner_size([1200.0, 800.0])
-        .with_min_inner_size([760.0, 560.0]);
+        .with_min_inner_size([760.0, 560.0])
+        .with_decorations(false);
     if let Some(icon) = icons::window_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -49,8 +53,12 @@ fn install_chinese_fonts(ctx: &egui::Context) {
         return;
     };
     let mut fonts = FontDefinitions::default();
+    let mut primary = None;
     for name in ["msyh.ttc", "msyh.ttf", "simsun.ttc", "seguisym.ttf"] {
         if let Ok(bytes) = std::fs::read(windows.join("Fonts").join(name)) {
+            if primary.is_none() && name.starts_with("msyh") {
+                primary = Some(name.to_owned());
+            }
             fonts
                 .font_data
                 .insert(name.into(), FontData::from_owned(bytes).into());
@@ -58,6 +66,11 @@ fn install_chinese_fonts(ctx: &egui::Context) {
                 fonts.families.entry(family).or_default().push(name.into());
             }
         }
+    }
+    if let Some(primary) = primary {
+        let family = fonts.families.entry(FontFamily::Proportional).or_default();
+        family.retain(|name| name != &primary);
+        family.insert(0, primary);
     }
     ctx.set_fonts(fonts);
 }
