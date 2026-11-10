@@ -49,11 +49,11 @@ Release 文件位于 `target\release\fnmusic.exe`。调试时可使用 `cargo ru
 
 提交到 `main`、提交 Pull Request 或手动运行 Actions 中的 `Windows build and package`，将执行格式检查、测试和 Windows x64 Release 构建。成功后可在运行记录的 Artifacts 下载便携 ZIP 和 SHA-256 校验文件。包内含程序、说明和许可证；运行仍需要 WebView2 Runtime。
 
-正式发布仅由版本标签触发，不再随着 main 提交覆盖滚动预览版。标签必须与 Cargo.toml 的版本一致，例如当前版本为 `0.2.1`，则使用 `v0.2.1`。版本不一致会停止构建；已公开的同名版本不会被覆盖，应递增版本号后重新发布。
+正式发布仅由版本标签触发，不再随着 main 提交覆盖滚动预览版。标签必须与 Cargo.toml 的版本一致，例如当前版本为 `0.2.2`，则使用 `v0.2.2`。版本不一致会停止构建；已公开的同名版本不会被覆盖，应递增版本号后重新发布。
 
-发布步骤：修改 Cargo.toml 的版本并同步 Cargo.lock，提交代码，然后执行 `git tag v0.2.1` 和 `git push origin main v0.2.1`。后续版本相应替换版本号。流水线先构建和检查，再把所有附件上传到草稿 Release，最后公开为最新正式版本。发布任务单独获得仓库内容写权限，不需要额外配置访问令牌。
+发布步骤：修改 Cargo.toml 的版本并同步 Cargo.lock，提交代码，然后执行 `git tag v0.2.2` 和 `git push origin main v0.2.2`。后续版本相应替换版本号。流水线先构建和检查，再把所有附件上传到草稿 Release，最后公开为最新正式版本。发布任务单独获得仓库内容写权限，不需要额外配置访问令牌。
 
-Release 提供带版本号的便携 ZIP（如 `FnMusic-v0.2.1-windows-x64.zip`）、独立的 `fnmusic.exe`、自动更新元数据 `update.json` 和 `SHA256SUMS.txt`。旧的 preview 仅作历史下载保留，不再自动刷新。版本变更见 [更新记录](CHANGELOG.md)。
+Release 提供带版本号的便携 ZIP（如 `FnMusic-v0.2.2-windows-x64.zip`）、独立的 `fnmusic.exe`、自动更新元数据 `update.json` 和 `SHA256SUMS.txt`。旧的 preview 仅作历史下载保留，不再自动刷新。版本变更见 [更新记录](CHANGELOG.md)。
 
 ## 应用内更新
 
