@@ -1,5 +1,6 @@
 mod app;
 mod artwork;
+mod daily;
 mod desktop;
 mod experience;
 mod icons;

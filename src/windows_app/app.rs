@@ -13,13 +13,14 @@ use fnmusic::{
     api::{self, Api, Credentials, Error, Session},
     library::{self, Collection, Kind, Listing, Page, Track},
     playback::{self, LyricLine, Queue, Repeat},
+    recommendation,
     relay::Relay,
     storage::random_id,
 };
 use tokio::{runtime::Runtime, sync::Semaphore};
 
 use super::{
-    artwork,
+    artwork, daily,
     desktop::{Command, Desktop},
     experience::{LyricFollow, SleepTimer},
     icons::{self, Icon},
@@ -53,6 +54,7 @@ struct Connection {
 }
 
 enum Event {
+    Daily(u64, recommendation::Day, api::Result<recommendation::Cache>),
     UpdateChecked(u64, std::result::Result<Option<updater::Release>, String>),
     UpdateProgress(u64, u64, u64),
     UpdateDownloaded(u64, std::result::Result<updater::Staged, String>),
@@ -173,6 +175,12 @@ impl Default for UpdateUi {
 }
 
 pub struct MusicApp {
+    daily_cache: Option<recommendation::Cache>,
+    daily_day: recommendation::Day,
+    daily_path: Option<PathBuf>,
+    daily_loading: bool,
+    daily_error: Option<String>,
+    daily_check_at: Instant,
     update: UpdateUi,
     desktop: Option<Desktop>,
     close_to_tray: bool,
@@ -988,6 +996,12 @@ impl MusicApp {
         let now = Instant::now();
         let preferences = vault.preferences();
         let mut app = Self {
+            daily_cache: None,
+            daily_day: daily::today(),
+            daily_path: None,
+            daily_loading: false,
+            daily_error: None,
+            daily_check_at: now,
             update: UpdateUi::default(),
             desktop: None,
             close_to_tray: preferences.close_to_tray,
@@ -1192,6 +1206,10 @@ impl MusicApp {
 
     fn disconnect(&mut self, explicit: bool) {
         self.persist();
+        self.daily_cache = None;
+        self.daily_path = None;
+        self.daily_loading = false;
+        self.daily_error = None;
         let session = self.session.take();
         self.stop_media();
         self.session_epoch += 1;
@@ -1251,6 +1269,15 @@ impl MusicApp {
 
     fn open_page(&mut self, page: Page, remember: bool) {
         let changed = self.page != page;
+        if page == Page::Daily
+            && !changed
+            && self
+                .daily_cache
+                .as_ref()
+                .is_some_and(|cache| cache.current.tracks.is_empty())
+        {
+            self.daily_cache = None;
+        }
         if remember && self.page != page {
             let entry = self.take_history_entry();
             if self.previous.len() == HISTORY_LIMIT {
@@ -1316,6 +1343,11 @@ impl MusicApp {
     }
 
     fn load_page(&mut self, number: u32) {
+        if self.page == Page::Daily {
+            self.show_daily_listing();
+            self.request_daily();
+            return;
+        }
         let Some(session) = self.session.clone() else {
             return;
         };
@@ -1328,6 +1360,103 @@ impl MusicApp {
             let result = library::load(&session, &page, number).await;
             events.send(Event::Page(epoch, number, result));
         });
+    }
+
+    fn show_daily_listing(&mut self) {
+        if self.page != Page::Daily {
+            return;
+        }
+        self.listing = Listing::default();
+        self.page_number = 0;
+        self.loading = self.daily_loading;
+        self.page_error = self.daily_error.clone();
+        if let Some(cache) = self
+            .daily_cache
+            .as_ref()
+            .filter(|cache| cache.current.day == self.daily_day)
+        {
+            self.listing.tracks = cache.current.tracks.clone();
+            for track in &mut self.listing.tracks {
+                if let Some(on) = self.favorite_confirmed.get(&track.id) {
+                    track.favorite = *on;
+                }
+            }
+            self.track_table.sort_tracks(&mut self.listing.tracks);
+            self.track_table.retain(&self.listing.tracks);
+            self.page_number = 1;
+            self.loading = false;
+        }
+    }
+
+    fn request_daily(&mut self) {
+        if self.daily_loading
+            || self
+                .daily_cache
+                .as_ref()
+                .is_some_and(|cache| cache.current.day == self.daily_day)
+        {
+            return;
+        }
+        let (Some(session), Some(path)) = (self.session.clone(), self.daily_path.clone()) else {
+            return;
+        };
+        self.daily_loading = true;
+        self.daily_error = None;
+        self.show_daily_listing();
+        let epoch = self.session_epoch;
+        let day = self.daily_day;
+        let events = self.events.clone();
+        self.runtime.spawn(async move {
+            events.send(Event::Daily(
+                epoch,
+                day,
+                daily::load(&session, &path, day).await,
+            ));
+        });
+    }
+
+    fn check_daily_date(&mut self, ctx: &egui::Context) {
+        if self.session.is_none() {
+            return;
+        }
+        if Instant::now() >= self.daily_check_at {
+            self.daily_check_at = Instant::now() + Duration::from_secs(30);
+            let day = daily::today();
+            if self.daily_day != day {
+                self.daily_day = day;
+                self.daily_cache = None;
+                self.daily_loading = false;
+                self.daily_error = None;
+                // Historical daily pages must not bring yesterday's list back.
+                for entry in self
+                    .previous
+                    .iter_mut()
+                    .chain(&mut self.forward)
+                    .filter(|entry| entry.page == Page::Daily)
+                {
+                    entry.listing = Listing::default();
+                    entry.number = 0;
+                }
+                self.show_daily_listing();
+                self.request_daily();
+            }
+        }
+        ctx.request_repaint_after(Duration::from_secs(30));
+    }
+
+    fn play_daily(&mut self) {
+        if let Some(cache) = &self.daily_cache {
+            if !cache.current.tracks.is_empty() {
+                let mut tracks = cache.current.tracks.clone();
+                for track in &mut tracks {
+                    if let Some(on) = self.favorite_confirmed.get(&track.id) {
+                        track.favorite = *on;
+                    }
+                }
+                self.queue.replace(tracks, 0);
+                self.track_changed(true);
+            }
+        }
     }
 
     fn request_lyrics(&mut self) {
@@ -1547,6 +1676,11 @@ impl MusicApp {
                                 queue,
                             } = *connection;
                             self.session_epoch += 1;
+                            self.daily_cache = None;
+                            self.daily_day = daily::today();
+                            self.daily_path = Some(self.vault.daily_file(&credentials));
+                            self.daily_loading = false;
+                            self.daily_error = None;
                             self.use_fn_connect = credentials.fn_id.is_some();
                             self.server_input = credentials
                                 .fn_id
@@ -1562,6 +1696,7 @@ impl MusicApp {
                             self.saved_at = Instant::now();
                             self.open_page(Page::Home, false);
                             self.load_sidebar_playlists();
+                            self.request_daily();
                             self.request_lyrics();
                         }
                         Err(error) => self.notice = Some(error.to_string()),
@@ -1581,6 +1716,29 @@ impl MusicApp {
                         self.exiting = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
+                }
+                Event::Daily(epoch, day, result)
+                    if epoch == self.session_epoch && day == self.daily_day =>
+                {
+                    self.daily_loading = false;
+                    match result {
+                        Ok(mut cache) => {
+                            for track in &mut cache.current.tracks {
+                                if let Some(on) = self.favorite_confirmed.get(&track.id) {
+                                    track.favorite = *on;
+                                }
+                            }
+                            if let Some(path) = &self.daily_path {
+                                if daily::save(path, &cache).is_err() {
+                                    self.notice = Some("今日推荐已生成，但无法保存本地缓存".into());
+                                }
+                            }
+                            self.daily_error = None;
+                            self.daily_cache = Some(cache);
+                        }
+                        Err(err) => self.daily_error = Some(err.to_string()),
+                    }
+                    self.show_daily_listing();
                 }
                 Event::Page(epoch, number, result) if epoch == self.page_epoch => {
                     self.loading = false;
@@ -1632,6 +1790,19 @@ impl MusicApp {
                         Ok(()) => {
                             self.favorite_confirmed.insert(id.clone(), on);
                             self.queue.set_favorite(&id, on);
+                            if let Some(cache) = &mut self.daily_cache {
+                                for track in cache
+                                    .current
+                                    .tracks
+                                    .iter_mut()
+                                    .filter(|track| track.id == id)
+                                {
+                                    track.favorite = on;
+                                }
+                                if let Some(path) = &self.daily_path {
+                                    let _ = daily::save(path, cache);
+                                }
+                            }
                             self.dirty = true;
                             for entry in self.previous.iter_mut().chain(&mut self.forward) {
                                 if entry.page == Page::Favorites {
@@ -2182,6 +2353,7 @@ impl MusicApp {
                 let highlight = ui.painter().add(egui::Shape::Noop);
                 for (page, icon) in [
                     (Page::Home, Icon::Home),
+                    (Page::Daily, Icon::Sparkles),
                     (Page::Tracks, Icon::Music),
                     (Page::Albums, Icon::Albums),
                     (Page::Artists, Icon::Artist),
@@ -2329,6 +2501,117 @@ impl MusicApp {
         }
     }
 
+    fn daily_banner(&mut self, ui: &mut egui::Ui) -> bool {
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 146.0), egui::Sense::hover());
+        let accent = ui.visuals().hyperlink_color;
+        ui.painter().rect(
+            rect,
+            18,
+            accent.gamma_multiply(0.07),
+            egui::Stroke::new(0.7_f32, accent.gamma_multiply(0.16)),
+            egui::StrokeKind::Inside,
+        );
+        let calendar = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 60.0, rect.center().y),
+            Vec2::splat(80.0),
+        );
+        ui.painter()
+            .rect_filled(calendar, 17, accent.gamma_multiply(0.14));
+        ui.painter().text(
+            egui::pos2(calendar.center().x, calendar.top() + 19.0),
+            egui::Align2::CENTER_CENTER,
+            format!("{}月", self.daily_day.month),
+            egui::FontId::proportional(13.0),
+            accent,
+        );
+        ui.painter().text(
+            egui::pos2(calendar.center().x, calendar.top() + 51.0),
+            egui::Align2::CENTER_CENTER,
+            self.daily_day.day.to_string(),
+            egui::FontId::proportional(36.0),
+            accent,
+        );
+        let left = calendar.right() + 22.0;
+        let width = (rect.right() - left - 18.0).max(50.0);
+        let description = if self.daily_loading {
+            "正在为你挑选今天的音乐…".to_owned()
+        } else if self.daily_error.is_some() {
+            "暂时无法生成，打开每日推荐可重试".to_owned()
+        } else if let Some(cache) = &self.daily_cache {
+            if cache.current.tracks.is_empty() {
+                "曲库里还没有可推荐的歌曲".to_owned()
+            } else if cache.current.personalized {
+                format!("参考你的收藏 · 今日精选 {} 首", cache.current.tracks.len())
+            } else {
+                format!(
+                    "让熟悉的曲库带来新鲜感 · 今日 {} 首",
+                    cache.current.tracks.len()
+                )
+            }
+        } else {
+            "每天更新，发现曲库里值得再听的好歌".to_owned()
+        };
+        for (value, y, size, color) in [
+            (
+                "每日推荐".to_owned(),
+                rect.top() + 18.0,
+                24.0,
+                ui.visuals().text_color(),
+            ),
+            (
+                description,
+                rect.top() + 54.0,
+                12.0,
+                widgets::secondary_text(ui),
+            ),
+        ] {
+            let mut job = egui::text::LayoutJob::simple_singleline(
+                value,
+                egui::FontId::proportional(size),
+                color,
+            );
+            job.wrap.max_width = width;
+            job.wrap.max_rows = 1;
+            ui.painter().galley(
+                egui::pos2(left, y).round_to_pixels(ui.ctx().pixels_per_point()),
+                ui.painter().layout_job(job),
+                color,
+            );
+        }
+        let title_hit = ui.interact(
+            egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.top() + 84.0)),
+            ui.id().with("daily-open"),
+            egui::Sense::click(),
+        );
+        let mut open = title_hit
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked();
+        let mut play = false;
+        let ready = self
+            .daily_cache
+            .as_ref()
+            .is_some_and(|cache| !cache.current.tracks.is_empty());
+        let mut controls = ui.new_child(
+            egui::UiBuilder::new()
+                .id_salt("daily-actions")
+                .max_rect(egui::Rect::from_min_max(
+                    egui::pos2(left, rect.top() + 91.0),
+                    egui::pos2(rect.right() - 18.0, rect.bottom() - 16.0),
+                ))
+                .layout(Layout::left_to_right(Align::Center)),
+        );
+        controls.add_enabled_ui(ready, |ui| {
+            play = self.primary_action(ui, "立即播放").clicked();
+        });
+        controls.add_space(6.0);
+        open |= widgets::pill(&mut controls, Icon::Forward, "查看推荐").clicked();
+        if play {
+            self.play_daily();
+        }
+        open
+    }
+
     fn library_view(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
             .frame(
@@ -2343,6 +2626,7 @@ impl MusicApp {
                     egui::Id::new((self.page_epoch, self.lyrics_detail)),
                 ));
                 let mut open = None;
+                let mut open_daily = false;
                 let mut play = None;
                 let mut load_more = false;
                 let mut area = egui::ScrollArea::vertical().id_salt(("library", self.page_epoch));
@@ -2356,6 +2640,10 @@ impl MusicApp {
                     ui.label(RichText::new(title).size(32.0).strong());
                     let subtitle = match &self.page {
                         Page::Home => Some("来自 NAS 的音乐资料库".to_owned()),
+                        Page::Daily => Some(format!(
+                            "{} · 每天为你挑选，今日列表保持不变",
+                            self.daily_day.label()
+                        )),
                         Page::Detail(collection) => Some(collection.subtitle.clone()),
                         Page::Search(query) => Some(format!("“{query}”")),
                         _ => None,
@@ -2372,6 +2660,27 @@ impl MusicApp {
                         });
                     }
                     ui.add_space(9.0);
+
+                    if self.page == Page::Home {
+                        open_daily = self.daily_banner(ui);
+                        ui.add_space(16.0);
+                    } else if self.page == Page::Daily && !self.listing.tracks.is_empty() {
+                        ui.horizontal(|ui| {
+                            if self.primary_action(ui, "播放全部").clicked() {
+                                play = Some(0);
+                            }
+                            if widgets::pill(ui, Icon::Queue, "加入播放列表").clicked() {
+                                for track in self.listing.tracks.clone() {
+                                    self.add_to_queue(track, false);
+                                }
+                                self.notice = Some(format!(
+                                    "已添加 {} 首到播放列表",
+                                    self.listing.tracks.len()
+                                ));
+                            }
+                        });
+                        ui.add_space(10.0);
+                    }
 
                     if let Page::Detail(collection) = self.page.clone() {
                         ui.horizontal(|ui| {
@@ -2422,6 +2731,7 @@ impl MusicApp {
                         ui.add_space(12.0);
                         load_more = ui.button("加载更多").clicked();
                     } else if self.page_number == 1
+                        && self.page != Page::Home
                         && self.listing.tracks.is_empty()
                         && self.listing.albums.is_empty()
                         && self.listing.artists.is_empty()
@@ -2449,6 +2759,9 @@ impl MusicApp {
                 }
                 if let Some(collection) = open {
                     self.open_page(Page::Detail(collection), true);
+                }
+                if open_daily {
+                    self.open_page(Page::Daily, true);
                 }
             });
     }
@@ -3974,6 +4287,7 @@ impl eframe::App for MusicApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
         self.process_events(ctx);
+        self.check_daily_date(ctx);
         self.update_media();
         self.update_desktop(ctx);
         self.title_bar(ctx);

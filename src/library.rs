@@ -76,6 +76,7 @@ pub struct Collection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Page {
     Home,
+    Daily,
     Tracks,
     Albums,
     Artists,
@@ -89,6 +90,7 @@ impl Page {
     pub fn title(&self) -> &str {
         match self {
             Self::Home => "首页",
+            Self::Daily => "每日推荐",
             Self::Tracks => "歌曲",
             Self::Albums => "专辑",
             Self::Artists => "艺人",
@@ -348,6 +350,15 @@ async fn tracks(
             tracks.push(track);
         }
     }
+    fill_track_covers(session, &mut tracks, &missing).await;
+    Ok(Listing {
+        tracks,
+        has_more,
+        ..Listing::default()
+    })
+}
+
+async fn fill_track_covers(session: &Session, tracks: &mut [Track], missing: &[(usize, String)]) {
     // Playlist responses can contain a track GUID as coverId and omit the
     // album cover. Resolve only missing artwork, once per album in this page.
     if !missing.is_empty() {
@@ -374,22 +385,126 @@ async fn tracks(
             .collect()
             .await;
         for (index, id) in missing {
-            if let Some(cover) = covers.get(&id) {
-                tracks[index].cover = cover.clone();
+            if let Some(cover) = covers.get(id) {
+                tracks[*index].cover = cover.clone();
             }
         }
     }
-    Ok(Listing {
-        tracks,
-        has_more,
-        ..Listing::default()
-    })
+}
+
+pub struct DailyCandidates {
+    pub tracks: Vec<Track>,
+    albums: std::collections::HashMap<String, String>,
+}
+
+pub async fn daily_candidates(session: &Session, seed: u64) -> Result<DailyCandidates> {
+    use futures_util::{StreamExt, stream};
+    async fn page(session: &Session, path: &str, number: u32) -> Result<RawPage<RawTrack>> {
+        session
+            .json(
+                Method::GET,
+                path,
+                &[
+                    ("page", &number.to_string()),
+                    ("size", "500"),
+                    ("sort", "createdAt,desc"),
+                ],
+                None,
+            )
+            .await?
+            .ok_or(Error::Format)
+    }
+    let first = page(session, "/api/v1/track/list", 1).await?;
+    let first_rows = first.list.unwrap_or_default();
+    let total = first.total;
+    let pages =
+        crate::recommendation::candidate_pages(total.unwrap_or(first_rows.len()), 500, seed);
+    let mut raw = first_rows;
+    let more: Vec<_> = stream::iter(pages.into_iter().filter(|page| *page != 1))
+        .map(|number| page(session, "/api/v1/track/list", number))
+        .buffered(2)
+        .collect()
+        .await;
+    for result in more {
+        raw.extend(result?.list.unwrap_or_default());
+    }
+    if total.is_none() && raw.len() == 500 {
+        // Older NAS responses may omit total; read sequentially until a short
+        // page, while retaining the same request bound as sampled libraries.
+        for number in 2..=8 {
+            let rows = page(session, "/api/v1/track/list", number)
+                .await?
+                .list
+                .unwrap_or_default();
+            let more = rows.len() >= 500;
+            raw.extend(rows);
+            if !more {
+                break;
+            }
+        }
+    }
+    // Favorites are optional taste signals; permission/network errors must not
+    // prevent discovery from the rest of an otherwise accessible library.
+    for number in 1..=2 {
+        match rows::<RawTrack>(
+            session,
+            "/api/v1/favorite-track/list",
+            &[("sort", "favoriteAt,desc")],
+            number,
+            "500",
+        )
+        .await
+        {
+            Ok((mut favorites, more)) => {
+                for track in &mut favorites {
+                    track.is_favorite = Some(true);
+                }
+                raw.extend(favorites);
+                if !more {
+                    break;
+                }
+            }
+            Err(Error::Expired) => return Err(Error::Expired),
+            Err(_) => break,
+        }
+    }
+    let mut result = DailyCandidates {
+        tracks: Vec::new(),
+        albums: Default::default(),
+    };
+    for item in raw {
+        if let Some(album) = &item.album {
+            if !album.guid.is_empty() {
+                result.albums.insert(item.guid.clone(), album.guid.clone());
+            }
+        }
+        if let Some(track) = item.map("") {
+            result.tracks.push(track);
+        }
+    }
+    Ok(result)
+}
+
+pub async fn daily_covers(session: &Session, tracks: &mut [Track], candidates: &DailyCandidates) {
+    let missing: Vec<_> = tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, track)| track.cover.is_empty())
+        .filter_map(|(index, track)| {
+            candidates
+                .albums
+                .get(&track.id)
+                .map(|album| (index, album.clone()))
+        })
+        .collect();
+    fill_track_covers(session, tracks, &missing).await;
 }
 
 pub async fn load(session: &Session, page: &Page, number: u32) -> Result<Listing> {
     use Kind::{Album, Artist, Playlist};
 
     match page {
+        Page::Daily => Err(Error::Invalid("请从客户端的每日推荐入口打开".into())),
         Page::Home | Page::Albums => {
             collections(
                 session,

@@ -176,6 +176,18 @@ impl Vault {
     }
 
     pub fn queue_file(&self, session: &Credentials) -> PathBuf {
+        self.root
+            .join("queues")
+            .join(format!("{}.json", Self::account_key(session)))
+    }
+
+    pub fn daily_file(&self, session: &Credentials) -> PathBuf {
+        self.root
+            .join("recommendations")
+            .join(format!("{}.json", Self::account_key(session)))
+    }
+
+    fn account_key(session: &Credentials) -> String {
         let mut digest = Sha256::new();
         if let Some(id) = &session.fn_id {
             digest.update("fn-connect:");
@@ -185,9 +197,7 @@ impl Vault {
         }
         digest.update([0]);
         digest.update(&session.account_id);
-        self.root
-            .join("queues")
-            .join(format!("{:x}.json", digest.finalize()))
+        format!("{:x}", digest.finalize())
     }
 }
 
