@@ -177,7 +177,12 @@ impl Vault {
 
     pub fn queue_file(&self, session: &Credentials) -> PathBuf {
         let mut digest = Sha256::new();
-        digest.update(session.base.as_str());
+        if let Some(id) = &session.fn_id {
+            digest.update("fn-connect:");
+            digest.update(id);
+        } else {
+            digest.update(session.base.as_str());
+        }
         digest.update([0]);
         digest.update(&session.account_id);
         self.root

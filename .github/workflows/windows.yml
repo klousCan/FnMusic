@@ -40,7 +40,7 @@ jobs:
           $version = $env:FNMUSIC_VERSION
           New-Item -ItemType Directory -Path dist/FnMusic -Force | Out-Null
           Copy-Item target/x86_64-pc-windows-msvc/release/fnmusic.exe dist/FnMusic/
-          Copy-Item README.md,LICENSE,THIRD_PARTY_NOTICES.md dist/FnMusic/
+          Copy-Item README.md,CHANGELOG.md,LICENSE,THIRD_PARTY_NOTICES.md dist/FnMusic/
           Copy-Item dist/FnMusic/fnmusic.exe dist/fnmusic.exe
           $zip = "FnMusic-v$version-windows-x64.zip"
           Compress-Archive -Path dist/FnMusic -DestinationPath "dist/$zip"

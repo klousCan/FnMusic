@@ -191,6 +191,7 @@ pub struct MusicApp {
     session: Option<Arc<Session>>,
     saved: Option<Credentials>,
     server_input: String,
+    use_fn_connect: bool,
     auth_busy: bool,
     logging_out: bool,
     close_after_logout: bool,
@@ -1005,6 +1006,7 @@ impl MusicApp {
             session: None,
             saved: None,
             server_input: String::new(),
+            use_fn_connect: false,
             auth_busy: false,
             logging_out: false,
             close_after_logout: false,
@@ -1067,7 +1069,11 @@ impl MusicApp {
             .spawn_blocking(move || updater::cleanup_old_stages(&updates));
         match app.vault.load() {
             Ok(Some(credentials)) => {
-                app.server_input = credentials.base.to_string();
+                app.use_fn_connect = credentials.fn_id.is_some();
+                app.server_input = credentials
+                    .fn_id
+                    .clone()
+                    .unwrap_or_else(|| credentials.base.to_string());
                 app.saved = Some(credentials);
                 app.connect(true);
             }
@@ -1081,13 +1087,8 @@ impl MusicApp {
         if self.auth_busy {
             return;
         }
-        let base = match api::normalize_base(&self.server_input) {
-            Ok(base) => base,
-            Err(err) => {
-                self.notice = Some(err.to_string());
-                return;
-            }
-        };
+        let input = self.server_input.clone();
+        let use_fn_connect = self.use_fn_connect;
         let api = self.api.clone();
         let vault = self.vault.clone();
         let browser = self.browser.clone();
@@ -1097,11 +1098,47 @@ impl MusicApp {
         self.notice = None;
         self.runtime.spawn(async move {
             let result = async {
-                let credentials = if restore {
-                    vault.load()?.ok_or(Error::Expired)?
+                let restored = if restore {
+                    Some(vault.load()?.ok_or(Error::Expired)?)
                 } else {
-                    let request = api.authorization(&base).await?;
-                    let same = saved.as_ref().filter(|old| old.base == base);
+                    None
+                };
+                let fn_id = if let Some(credentials) = &restored {
+                    credentials.fn_id.clone()
+                } else if use_fn_connect {
+                    Some(fnmusic::fn_connect::parse_id(&input)?)
+                } else {
+                    fnmusic::fn_connect::id_from_link(&input).transpose()?
+                };
+                let (api, base, authorization) = if let Some(id) = fn_id.as_deref() {
+                    let (api, base, authorization) = api.resolve_fn_connect(id).await?;
+                    (api, base, Some(authorization))
+                } else {
+                    let base = match &restored {
+                        Some(credentials) => credentials.base.clone(),
+                        None => api::normalize_base(&input)?,
+                    };
+                    let api = api.with_nas_certificate_compatibility(&base)?;
+                    (api, base, None)
+                };
+                let credentials = if let Some(mut credentials) = restored {
+                    // Persist a newly resolved relay before validation, since
+                    // validation may renew and save a newer token itself.
+                    if credentials.base != base {
+                        credentials.base = base;
+                        vault.save(&credentials)?;
+                    }
+                    credentials
+                } else {
+                    let request = match authorization {
+                        Some(request) => request,
+                        None => api.authorization(&base).await?,
+                    };
+                    let same = saved.as_ref().filter(|old| match (&old.fn_id, &fn_id) {
+                        (Some(old), Some(new)) => old == new,
+                        (None, None) => old.base == base,
+                        _ => false,
+                    });
                     let profile = same
                         .map(|old| old.profile.clone())
                         .unwrap_or_else(random_id);
@@ -1510,6 +1547,11 @@ impl MusicApp {
                                 queue,
                             } = *connection;
                             self.session_epoch += 1;
+                            self.use_fn_connect = credentials.fn_id.is_some();
+                            self.server_input = credentials
+                                .fn_id
+                                .clone()
+                                .unwrap_or_else(|| credentials.base.to_string());
                             self.saved = Some(credentials);
                             self.session = Some(session);
                             self.queue_path = Some(queue_path);
@@ -1985,10 +2027,42 @@ impl MusicApp {
                 ui.label(RichText::new("连接你的 NAS，播放自己的音乐资料库").weak());
                 ui.add_space(25.0);
                 ui.add_enabled_ui(!self.auth_busy, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_space(((ui.available_width() - 340.0) * 0.5).max(0.0));
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        for (connect, label) in [(false, "IP / 域名"), (true, "FN Connect")] {
+                            if widgets::connection_choice(
+                                ui,
+                                label,
+                                self.use_fn_connect == connect,
+                                166.0,
+                            )
+                            .clicked()
+                            {
+                                self.use_fn_connect = connect;
+                                self.notice = None;
+                            }
+                        }
+                    });
+                    ui.add_space(14.0);
                     let field = ui.add(
                         egui::TextEdit::singleline(&mut self.server_input)
-                            .hint_text("NAS 地址，例如 192.168.1.10:5666")
+                            .hint_text(if self.use_fn_connect {
+                                "FN ID 或 https://fnos.net/你的FNID"
+                            } else {
+                                "NAS 地址，支持 http:// 或 https://"
+                            })
                             .desired_width(340.0),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(if self.use_fn_connect {
+                            "通过 HTTPS 中继连接，密码只在 NAS 官方页面输入"
+                        } else {
+                            "填写 NAS 地址，也可直接粘贴 FN Connect 链接"
+                        })
+                        .size(12.0)
+                        .weak(),
                     );
                     ui.add_space(12.0);
                     let login = ui.add(
@@ -2026,7 +2100,7 @@ impl MusicApp {
                 if self.auth_busy {
                     ui.add_space(12.0);
                     ui.spinner();
-                    ui.label("正在连接或等待 NAS 授权…");
+                    ui.label("正在解析连接或等待 NAS 授权…");
                 }
                 if let Some(notice) = &self.notice {
                     ui.add_space(14.0);

@@ -87,9 +87,44 @@ fn endpoint(base: &Url, suffix: &str) -> Url {
     url
 }
 
+fn authorization_base(base: &Url, configured: Option<&str>) -> Result<Url> {
+    let mut auth = match configured.map(str::trim).filter(|url| !url.is_empty()) {
+        Some(address) if address.starts_with('/') => {
+            let resolved = base.join(address).map_err(|_| Error::Format)?;
+            http_url(resolved.as_str())?
+        }
+        Some(address) => http_url(address)?,
+        None => http_url(&base.origin().ascii_serialization())?,
+    };
+    if auth.query().is_some() || auth.fragment().is_some() {
+        return Err(Error::Invalid("服务器提供的 NAS 授权地址不安全".into()));
+    }
+    if base.scheme() == "https" && auth.scheme() == "http" {
+        if auth.host() != base.host() {
+            return Err(Error::Invalid("HTTPS NAS 需要提供 HTTPS 授权地址".into()));
+        }
+        // Some NAS configurations advertise their HTTP administration port.
+        // Use the explicitly entered HTTPS origin while retaining the path.
+        auth.set_scheme("https").map_err(|_| Error::Format)?;
+        auth.set_port(base.port()).map_err(|_| Error::Format)?;
+    }
+    Ok(auth)
+}
+
 // URLSearchParams sorts by UTF-16 code units and the upstream signs the decoded
 // form string. Retain repeated keys and their relative value order.
 pub fn authx(method: &Method, url: &Url, body: &[u8], nonce: u32, timestamp: u128) -> String {
+    authx_with_key(method, url, body, nonce, timestamp, SIGN_KEY)
+}
+
+fn authx_with_key(
+    method: &Method,
+    url: &Url,
+    body: &[u8],
+    nonce: u32,
+    timestamp: u128,
+    key: &str,
+) -> String {
     let payload = if method == Method::GET {
         let mut sorted = BTreeMap::<Vec<u16>, Vec<(String, String)>>::new();
         for (key, value) in url.query_pairs() {
@@ -111,7 +146,7 @@ pub fn authx(method: &Method, url: &Url, body: &[u8], nonce: u32, timestamp: u12
         md5::compute(body)
     };
     let signature = md5::compute(format!(
-        "{SIGN_PREFIX}_{}_{nonce}_{timestamp}_{payload:x}_{SIGN_KEY}",
+        "{SIGN_PREFIX}_{}_{nonce}_{timestamp}_{payload:x}_{key}",
         url.path()
     ));
     format!("nonce={nonce}&timestamp={timestamp}&sign={signature:x}")
@@ -120,6 +155,8 @@ pub fn authx(method: &Method, url: &Url, body: &[u8], nonce: u32, timestamp: u12
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Credentials {
     pub base: Url,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fn_id: Option<String>,
     pub device_id: String,
     pub profile: String,
     pub username: String,
@@ -131,6 +168,7 @@ pub struct Credentials {
 pub struct Authorization {
     pub sign_in: Url,
     pub callback: Url,
+    pub relay: bool,
 }
 
 impl Authorization {
@@ -199,20 +237,113 @@ struct User {
 #[derive(Clone)]
 pub struct Api {
     client: Client,
+    nas_client: Option<(url::Origin, Client)>,
+    fn_id: Option<String>,
 }
 
 impl Api {
     pub fn new() -> Result<Self> {
-        let client = Client::builder()
+        Ok(Self {
+            client: Self::client(false)?,
+            nas_client: None,
+            fn_id: None,
+        })
+    }
+
+    fn client(ignore_certificate_errors: bool) -> Result<Client> {
+        Client::builder()
             .use_native_tls()
+            .danger_accept_invalid_certs(ignore_certificate_errors)
+            .danger_accept_invalid_hostnames(ignore_certificate_errors)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(8))
             .read_timeout(Duration::from_secs(15))
             .user_agent(concat!("FnMusic/", env!("CARGO_PKG_VERSION")))
             .build()
-            .map_err(|_| Error::Network)?;
-        Ok(Self { client })
+            .map_err(|_| Error::Network)
+    }
+
+    /// The compatibility client must never be used for a different origin, even
+    /// when that origin was supplied by the NAS in an artwork or OAuth URL.
+    /// Redirects remain disabled so they cannot extend this exception.
+    pub fn with_nas_certificate_compatibility(&self, base: &Url) -> Result<Self> {
+        Ok(Self {
+            client: self.client.clone(),
+            nas_client: if base.scheme() == "https" {
+                Some((base.origin(), Self::client(true)?))
+            } else {
+                None
+            },
+            fn_id: None,
+        })
+    }
+
+    /// Only the public FN ID goes to the gateway. NAS credentials are sent after
+    /// resolution, exclusively to a returned relay using the normal NAS API.
+    pub async fn resolve_fn_connect(&self, input: &str) -> Result<(Self, Url, Authorization)> {
+        use crate::fn_connect;
+        let id = fn_connect::parse_id(input)?;
+        let url = Url::parse(fn_connect::GATEWAY).map_err(|_| Error::Format)?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let nonce = rand::rng().random_range(100_000..1_000_000);
+        let body =
+            serde_json::to_vec(&serde_json::json!({"fnId": id})).map_err(|_| Error::Format)?;
+        let response = self
+            .client
+            .post(url.clone())
+            .header(CONTENT_TYPE, "application/json")
+            .header(
+                "authx",
+                authx_with_key(
+                    &Method::POST,
+                    &url,
+                    &body,
+                    nonce,
+                    timestamp,
+                    fn_connect::API_KEY,
+                ),
+            )
+            .header("fn-sign", fn_connect::gateway_sign(&id, timestamp))
+            .body(body)
+            .timeout(Duration::from_secs(12))
+            .send()
+            .await
+            .map_err(|_| Error::Invalid("无法连接 FN Connect 官方网关，请检查网络".into()))?;
+        if !response.status().is_success() {
+            return Err(Error::Http(response.status()));
+        }
+        #[derive(Deserialize)]
+        struct RelayData {
+            #[serde(rename = "fn", default)]
+            addresses: Vec<String>,
+        }
+        let reply: Envelope<RelayData> =
+            serde_json::from_slice(&limited_body(response, 64 * 1024).await?)
+                .map_err(|_| Error::Format)?;
+        if reply.code != 0 {
+            return Err(Error::Invalid(format!(
+                "FN Connect 无法解析该 FN ID（代码 {}），请确认 FN ID 正确且 NAS 在线",
+                reply.code
+            )));
+        }
+        let bases = fn_connect::relay_bases(&reply.data.ok_or(Error::Format)?.addresses)?;
+        let mut last_error = Error::Network;
+        for base in bases {
+            let mut api = self.with_nas_certificate_compatibility(&base)?;
+            api.fn_id = Some(id.clone());
+            match tokio::time::timeout(Duration::from_secs(10), api.authorization(&base)).await {
+                Ok(Ok(auth)) => return Ok((api, base, auth)),
+                Ok(Err(err)) => last_error = err,
+                Err(_) => last_error = Error::Network,
+            }
+        }
+        Err(Error::Invalid(format!(
+            "无法通过 FN Connect 连接飞牛音乐：{last_error}"
+        )))
     }
 
     async fn request(
@@ -235,13 +366,29 @@ impl Api {
             nonce,
             timestamp,
         );
-        let mut request = self
-            .client
+        let client = self
+            .nas_client
+            .as_ref()
+            .filter(|(origin, _)| *origin == url.origin())
+            .map_or(&self.client, |(_, client)| client);
+        let relay = self.fn_id.is_some()
+            && self
+                .nas_client
+                .as_ref()
+                .is_some_and(|(origin, _)| *origin == url.origin());
+        let mut request = client
             .request(method, url)
             .header("authx", signature)
             .header(ACCEPT_ENCODING, "identity");
+        let mut cookies = Vec::new();
         if let Some(token) = token {
-            request = request.header(COOKIE, format!("music-token={token}"));
+            cookies.push(format!("music-token={token}"));
+        }
+        if relay {
+            cookies.push("mode=relay".into());
+        }
+        if !cookies.is_empty() {
+            request = request.header(COOKIE, cookies.join("; "));
         }
         if let Some(range) = range {
             request = request.header(RANGE, range);
@@ -295,19 +442,10 @@ impl Api {
             .nas_o_auth
             .filter(|cfg| !cfg.client_id.is_empty())
             .ok_or_else(|| Error::Invalid("该服务器未开启 NAS 账号授权".into()))?;
-        let auth_base = oauth
-            .url
-            .as_deref()
-            .filter(|url| !url.trim().is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| base.origin().ascii_serialization());
-        let auth_base = http_url(&auth_base)?;
-        if auth_base.query().is_some()
-            || auth_base.fragment().is_some()
-            || (base.scheme() == "https" && auth_base.scheme() != "https")
-        {
-            return Err(Error::Invalid("服务器提供的 NAS 授权地址不安全".into()));
-        }
+        // A relay must keep OAuth on its externally reachable origin; the NAS
+        // may advertise a LAN-only administration address in its configuration.
+        let relay = self.fn_id.is_some();
+        let auth_base = authorization_base(base, if relay { None } else { oauth.url.as_deref() })?;
         let callback = endpoint(base, "/oauth/result");
         let mut sign_in = auth_base;
         sign_in.set_path(&format!("{}/signin", sign_in.path().trim_end_matches('/')));
@@ -316,7 +454,11 @@ impl Api {
             .append_pair("client_id", &oauth.client_id)
             .append_pair("redirect_uri", callback.as_str())
             .append_pair("app_name", "飞牛音乐");
-        Ok(Authorization { sign_in, callback })
+        Ok(Authorization {
+            sign_in,
+            callback,
+            relay,
+        })
     }
 
     pub async fn exchange(
@@ -362,6 +504,7 @@ impl Api {
             .unwrap_or_else(|| "NAS 用户".into());
         Ok(Credentials {
             base,
+            fn_id: self.fn_id.clone(),
             device_id,
             profile,
             username,
@@ -695,6 +838,7 @@ mod tests {
         let auth = Authorization {
             sign_in: Url::parse("https://login.nas/signin").unwrap(),
             callback: Url::parse("https://nas/music/oauth/result").unwrap(),
+            relay: false,
         };
         let code = |url| auth.callback_code(&Url::parse(url).unwrap());
         assert_eq!(

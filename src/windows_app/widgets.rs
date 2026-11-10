@@ -456,6 +456,23 @@ pub fn mode_card(
     response
 }
 
+pub fn connection_choice(ui: &mut Ui, label: &str, selected: bool, width: f32) -> Response {
+    let accent = ui.visuals().hyperlink_color;
+    let (rect, response) = choice_frame(ui, label, selected, vec2(width, 36.0), accent);
+    ui.painter().text(
+        rect.center().round_to_pixels(ui.ctx().pixels_per_point()),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(13.0),
+        if selected {
+            accent
+        } else {
+            ui.visuals().text_color()
+        },
+    );
+    response
+}
+
 pub fn accent_card(
     ui: &mut Ui,
     label: &str,

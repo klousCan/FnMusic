@@ -18,10 +18,15 @@ use tao::{
 use tokio::sync::oneshot;
 use url::Url;
 use webview2_com::{
-    ClearBrowsingDataCompletedHandler,
-    Microsoft::Web::WebView2::Win32::{ICoreWebView2_13, ICoreWebView2Profile2},
+    ClearBrowsingDataCompletedHandler, ClearServerCertificateErrorActionsCompletedHandler,
+    Microsoft::Web::WebView2::Win32::{
+        COREWEBVIEW2_SERVER_CERTIFICATE_ERROR_ACTION_ALWAYS_ALLOW,
+        COREWEBVIEW2_SERVER_CERTIFICATE_ERROR_ACTION_CANCEL, ICoreWebView2_2, ICoreWebView2_13,
+        ICoreWebView2_14, ICoreWebView2Profile2,
+    },
+    ServerCertificateErrorDetectedEventHandler, take_pwstr,
 };
-use windows::core::Interface;
+use windows::core::{Interface, PCWSTR, PWSTR, w};
 use wry::{WebContext, WebView, WebViewBuilder, WebViewExtWindows};
 
 use super::vault::Vault;
@@ -142,6 +147,84 @@ fn unavailable() -> Error {
     Error::Invalid("无法启动 NAS 授权窗口，请检查 Microsoft Edge WebView2 Runtime".into())
 }
 
+fn clear_certificate_actions(view: &ICoreWebView2_14) -> Result<()> {
+    let view = view.clone();
+    ClearServerCertificateErrorActionsCompletedHandler::wait_for_async_operation(
+        Box::new(move |callback| {
+            unsafe { view.ClearServerCertificateErrorActions(&callback)? };
+            Ok(())
+        }),
+        Box::new(|status| status),
+    )
+    .map_err(|_| Error::Storage)
+}
+
+fn configure_nas_certificate(webview: &WebView, nas: &Url) -> Result<()> {
+    let core = unsafe { webview.controller().CoreWebView2() }.map_err(|_| unavailable())?;
+    let view = match core.cast::<ICoreWebView2_14>() {
+        Ok(view) => view,
+        Err(_) if nas.scheme() != "https" => return Ok(()),
+        Err(_) => {
+            return Err(Error::Invalid(
+                "HTTPS NAS 证书兼容需要更新 Microsoft Edge WebView2 Runtime".into(),
+            ));
+        }
+    };
+    // WebView2 caches AlwaysAllow decisions for the profile's current session.
+    // Clear them before navigating so a previous login cannot widen this policy.
+    clear_certificate_actions(&view)?;
+    let origin = nas.origin();
+    let https = nas.scheme() == "https";
+    let handler = ServerCertificateErrorDetectedEventHandler::create(Box::new(move |_, args| {
+        if let Some(args) = args {
+            let mut uri = PWSTR::null();
+            let read = unsafe { args.RequestUri(&mut uri) };
+            let address = take_pwstr(uri);
+            let permitted = read.is_ok()
+                && https
+                && Url::parse(&address).is_ok_and(|url| {
+                    url.origin() == origin && url.username().is_empty() && url.password().is_none()
+                });
+            unsafe {
+                args.SetAction(if permitted {
+                    COREWEBVIEW2_SERVER_CERTIFICATE_ERROR_ACTION_ALWAYS_ALLOW
+                } else {
+                    COREWEBVIEW2_SERVER_CERTIFICATE_ERROR_ACTION_CANCEL
+                })?;
+            }
+        }
+        Ok(())
+    }));
+    let mut token = 0;
+    unsafe { view.add_ServerCertificateErrorDetected(&handler, &mut token) }
+        .map_err(|_| unavailable())
+}
+
+fn configure_relay_cookie(webview: &WebView, nas: &Url) -> Result<()> {
+    let domain: Vec<u16> = nas
+        .host_str()
+        .ok_or(Error::Format)?
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    unsafe {
+        let view = webview
+            .controller()
+            .CoreWebView2()
+            .and_then(|view| view.cast::<ICoreWebView2_2>())
+            .map_err(|_| unavailable())?;
+        let cookies = view.CookieManager().map_err(|_| unavailable())?;
+        let cookie = cookies
+            .CreateCookie(w!("mode"), w!("relay"), PCWSTR(domain.as_ptr()), w!("/"))
+            .map_err(|_| unavailable())?;
+        cookie.SetIsSecure(true).map_err(|_| unavailable())?;
+        cookies
+            .AddOrUpdateCookie(&cookie)
+            .map_err(|_| unavailable())?;
+    }
+    Ok(())
+}
+
 struct LoginWindow {
     // Drop the webview before its host window.
     _webview: WebView,
@@ -192,9 +275,10 @@ impl OAuthApp {
             let id = window.id();
             let proxy = self.proxy.clone();
             let sign_in = request.sign_in.to_string();
+            let nas = request.callback.clone();
+            let relay = request.relay;
             let mut context = WebContext::new(Some(self.profiles.join(&profile)));
             let webview = WebViewBuilder::with_web_context(&mut context)
-                .with_url(sign_in)
                 .with_navigation_handler(move |address| {
                     let Ok(target) = Url::parse(&address) else {
                         return false;
@@ -209,6 +293,12 @@ impl OAuthApp {
                 .with_devtools(false)
                 .build(&window)
                 .map_err(|_| unavailable())?;
+            // Install the certificate policy before the first HTTPS navigation.
+            configure_nas_certificate(&webview, &nas)?;
+            if relay {
+                configure_relay_cookie(&webview, &nas)?;
+            }
+            webview.load_url(&sign_in).map_err(|_| unavailable())?;
             if !silent {
                 window.set_visible(true);
                 window.set_focus();
@@ -259,6 +349,11 @@ impl OAuthApp {
         let webview = WebViewBuilder::with_web_context(&mut context)
             .build(&window)
             .map_err(|_| unavailable())?;
+        if let Ok(view) = unsafe { webview.controller().CoreWebView2() }
+            .and_then(|view| view.cast::<ICoreWebView2_14>())
+        {
+            clear_certificate_actions(&view)?;
+        }
         // Keep the controller alive until WebView2 confirms that it cleared its profile.
         let profile = unsafe {
             webview
@@ -383,7 +478,7 @@ mod tests {
             let callback = Url::parse(&format!("{origin}/music/oauth/result")).unwrap();
             let mut sign_in = Url::parse(&format!("{origin}/signin")).unwrap();
             sign_in.query_pairs_mut().append_pair("redirect_uri", callback.as_str());
-            let request = Authorization { sign_in, callback };
+            let request = Authorization { sign_in, callback, relay: false };
             let profile = "mock-browser".to_owned();
             for expected in ["new", "existing", "new"] {
                 let result = browser.authorize(request.clone(), profile.clone(), true).await.unwrap();
