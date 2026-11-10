@@ -58,6 +58,7 @@ pub enum AnimationMode {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Preferences {
+    pub auto_check_updates: bool,
     pub animation_mode: AnimationMode,
     pub close_to_tray: bool,
     pub color_mode: ColorMode,
@@ -69,6 +70,7 @@ pub struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
+            auto_check_updates: true,
             animation_mode: AnimationMode::On,
             close_to_tray: true,
             color_mode: ColorMode::System,
@@ -136,6 +138,10 @@ impl Vault {
 
     pub fn profiles(&self) -> PathBuf {
         self.root.join("webview")
+    }
+
+    pub fn updates(&self) -> PathBuf {
+        self.root.join("updates")
     }
 
     pub fn load(&self) -> Result<Option<Credentials>> {

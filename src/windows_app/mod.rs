@@ -7,12 +7,18 @@ mod media;
 mod motion;
 mod oauth;
 mod track_table;
+mod updater;
 mod vault;
 mod widgets;
 
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily, ViewportBuilder};
 
 pub fn run() -> eframe::Result {
+    if updater::handle_command()
+        .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))))?
+    {
+        return Ok(());
+    }
     let Some(vault) = vault::Vault::open_or_activate()
         .map_err(|err| eframe::Error::AppCreation(Box::new(err)))?
     else {

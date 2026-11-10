@@ -26,6 +26,7 @@ use super::{
     media::{Media, MediaEvent},
     oauth::{Broker, Hooks},
     track_table::{Column, Table},
+    updater,
     vault::{self, Accent, ColorMode, Preferences, Vault},
     widgets,
 };
@@ -52,6 +53,10 @@ struct Connection {
 }
 
 enum Event {
+    UpdateChecked(u64, std::result::Result<Option<updater::Release>, String>),
+    UpdateProgress(u64, u64, u64),
+    UpdateDownloaded(u64, std::result::Result<updater::Staged, String>),
+    UpdateInstallerReady(u64, std::result::Result<(), String>),
     Connected(api::Result<Box<Connection>>),
     LoggedOut(api::Result<()>),
     Page(u64, u32, api::Result<Listing>),
@@ -130,7 +135,45 @@ struct TrackDrag {
     tracks: Vec<Track>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum UpdatePhase {
+    #[default]
+    Idle,
+    Checking,
+    Downloading,
+    Installing,
+}
+
+struct UpdateUi {
+    open: bool,
+    phase: UpdatePhase,
+    release: Option<updater::Release>,
+    message: Option<String>,
+    progress: (u64, u64),
+    epoch: u64,
+    cancel: Option<tokio_util::sync::CancellationToken>,
+    automatic_due: Option<Instant>,
+    startup_ack: Option<PathBuf>,
+}
+
+impl Default for UpdateUi {
+    fn default() -> Self {
+        Self {
+            open: false,
+            phase: UpdatePhase::Idle,
+            release: None,
+            message: None,
+            progress: (0, 0),
+            epoch: 0,
+            cancel: None,
+            automatic_due: Some(Instant::now() + Duration::from_secs(5)),
+            startup_ack: std::env::var_os("FNMUSIC_UPDATE_ACK").map(PathBuf::from),
+        }
+    }
+}
+
 pub struct MusicApp {
+    update: UpdateUi,
     desktop: Option<Desktop>,
     close_to_tray: bool,
     preferences: Preferences,
@@ -415,6 +458,218 @@ impl MusicApp {
         }
     }
 
+    fn check_updates(&mut self, manual: bool) {
+        if self.update.phase != UpdatePhase::Idle {
+            self.update.open |= manual;
+            return;
+        }
+        self.update.automatic_due = None;
+        self.update.epoch += 1;
+        self.update.phase = UpdatePhase::Checking;
+        self.update.open |= manual;
+        self.update.message = None;
+        let epoch = self.update.epoch;
+        let events = self.events.clone();
+        self.runtime.spawn(async move {
+            events.send(Event::UpdateChecked(epoch, updater::check().await));
+        });
+    }
+
+    fn download_update(&mut self) {
+        let Some(release) = self.update.release.clone() else {
+            return;
+        };
+        if self.update.phase != UpdatePhase::Idle {
+            return;
+        }
+        self.update.epoch += 1;
+        self.update.phase = UpdatePhase::Downloading;
+        self.update.message = None;
+        self.update.progress = (0, 0);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        self.update.cancel = Some(cancel.clone());
+        let epoch = self.update.epoch;
+        let root = self.vault.updates();
+        let events = self.events.clone();
+        self.runtime.spawn(async move {
+            let result = updater::download(release, root, cancel, |received, total| {
+                events.send(Event::UpdateProgress(epoch, received, total));
+            })
+            .await;
+            events.send(Event::UpdateDownloaded(epoch, result));
+        });
+    }
+
+    fn update_window(&mut self, ctx: &egui::Context) {
+        if !self.update.open {
+            return;
+        }
+        let mut close = false;
+        egui::Window::new("软件更新")
+            .id(egui::Id::new("software-update"))
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .movable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(480.0)
+            .frame(
+                Frame::window(&ctx.style())
+                    .corner_radius(18)
+                    .inner_margin(20),
+            )
+            .show(ctx, |ui| {
+                super::motion::popup(ui);
+                ui.horizontal(|ui| {
+                    let rect = ui
+                        .allocate_exact_size(Vec2::splat(36.0), egui::Sense::hover())
+                        .0;
+                    ui.painter().rect_filled(
+                        rect,
+                        11,
+                        ui.visuals().hyperlink_color.gamma_multiply(0.08),
+                    );
+                    icons::glyph(
+                        ui,
+                        rect.center(),
+                        Icon::Refresh,
+                        ui.visuals().hyperlink_color,
+                    );
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("软件更新").size(18.0).strong());
+                        ui.label(
+                            RichText::new(format!("当前版本 v{}", updater::VERSION))
+                                .size(12.0)
+                                .weak(),
+                        );
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        close = ui
+                            .add_enabled_ui(self.update.phase != UpdatePhase::Installing, |ui| {
+                                icons::small(ui, Icon::WindowClose, "关闭更新窗口", false)
+                            })
+                            .inner
+                            .clicked();
+                    });
+                });
+                ui.add_space(14.0);
+                if let Some(release) = self.update.release.clone() {
+                    ui.label(
+                        RichText::new(format!("发现新版本 v{}", release.version))
+                            .size(16.0)
+                            .strong(),
+                    );
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("update-notes")
+                        .max_height(130.0)
+                        .show(ui, |ui| {
+                            ui.set_width((ui.available_width() - 10.0).max(0.0));
+                            ui.add(egui::Label::new(&release.notes).wrap());
+                        });
+                    ui.add_space(8.0);
+                    if ui.link("查看此版本的发布说明").clicked() {
+                        ctx.open_url(egui::OpenUrl::new_tab(release.page));
+                    }
+                }
+                if let Some(message) = &self.update.message {
+                    ui.add_space(8.0);
+                    ui.add(egui::Label::new(RichText::new(message).size(13.0)).wrap());
+                }
+                ui.add_space(12.0);
+                match self.update.phase {
+                    UpdatePhase::Checking => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("正在检查正式版本…");
+                        });
+                    }
+                    UpdatePhase::Downloading => {
+                        let (received, total) = self.update.progress;
+                        let fraction = if total > 0 {
+                            received as f32 / total as f32
+                        } else {
+                            0.0
+                        };
+                        ui.add(egui::ProgressBar::new(fraction).text(format!(
+                            "下载中 · {:.1} MB / {:.1} MB",
+                            received as f64 / 1048576.0,
+                            total as f64 / 1048576.0
+                        )));
+                        if ui.button("取消下载").clicked() {
+                            if let Some(cancel) = self.update.cancel.take() {
+                                cancel.cancel();
+                            }
+                            self.update.epoch += 1;
+                            self.update.phase = UpdatePhase::Idle;
+                            self.update.message = Some("已取消下载".into());
+                        }
+                    }
+                    UpdatePhase::Installing => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("正在准备更新，应用即将重启…");
+                        });
+                    }
+                    UpdatePhase::Idle => {
+                        if self.update.release.is_some() {
+                            ui.label(
+                                RichText::new("确认后下载并重启，当前播放将暂停。")
+                                    .size(12.0)
+                                    .weak(),
+                            );
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            RichText::new("下载并重启更新").color(Color32::WHITE),
+                                        )
+                                        .fill(ui.visuals().hyperlink_color)
+                                        .corner_radius(16)
+                                        .min_size(Vec2::new(148.0, 34.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.download_update();
+                                }
+                                if ui.button("稍后再说").clicked() {
+                                    close = true;
+                                }
+                            });
+                        } else if widgets::pill(ui, Icon::Refresh, "检查更新").clicked() {
+                            self.check_updates(true);
+                        }
+                    }
+                }
+                ui.add_space(8.0);
+                if ui.link("打开 GitHub 发布页面").clicked() {
+                    ctx.open_url(egui::OpenUrl::new_tab(updater::RELEASES));
+                }
+                ui.separator();
+                if widgets::action(
+                    ui,
+                    Icon::Refresh,
+                    "启动时检查更新",
+                    Some("仅检查正式版本，更新前会征求确认"),
+                    widgets::Row::Toggle(self.preferences.auto_check_updates),
+                )
+                .clicked()
+                {
+                    self.preferences.auto_check_updates = !self.preferences.auto_check_updates;
+                    if self.vault.save_preferences(&self.preferences).is_err() {
+                        self.update.message = Some("更新偏好保存失败".into());
+                    }
+                    if self.preferences.auto_check_updates {
+                        self.update.automatic_due = Some(Instant::now() + Duration::from_secs(2));
+                    }
+                }
+            });
+        if close {
+            self.update.open = false;
+        }
+    }
+
     fn system_command(&mut self, command: Command, ctx: &egui::Context) {
         match command {
             Command::Show => {
@@ -587,6 +842,30 @@ impl MusicApp {
             });
             self.sleep_menu(ui);
             ui.separator();
+            let update_description = if self.update.phase == UpdatePhase::Checking {
+                "正在检查新版本…".to_owned()
+            } else if let Some(release) = &self.update.release {
+                format!("发现新版本 v{}", release.version)
+            } else {
+                format!("当前版本 v{}", updater::VERSION)
+            };
+            if widgets::action(
+                ui,
+                Icon::Refresh,
+                "检查更新…",
+                Some(&update_description),
+                widgets::Row::Action,
+            )
+            .clicked()
+            {
+                ui.close_menu();
+                if self.update.release.is_some() {
+                    self.update.open = true;
+                } else {
+                    self.check_updates(true);
+                }
+            }
+            ui.separator();
             if widgets::action(
                 ui,
                 Icon::Logout,
@@ -708,6 +987,7 @@ impl MusicApp {
         let now = Instant::now();
         let preferences = vault.preferences();
         let mut app = Self {
+            update: UpdateUi::default(),
             desktop: None,
             close_to_tray: preferences.close_to_tray,
             preferences: preferences.clone(),
@@ -777,6 +1057,14 @@ impl MusicApp {
             locate_queue: false,
         };
         app.apply_appearance(&app.events.ctx);
+        if let Some(message) = updater::take_error(&app.vault.updates()) {
+            app.update.message = Some(message);
+            app.update.open = true;
+            app.update.automatic_due = None;
+        }
+        let updates = app.vault.updates();
+        app.runtime
+            .spawn_blocking(move || updater::cleanup_old_stages(&updates));
         match app.vault.load() {
             Ok(Some(credentials)) => {
                 app.server_input = credentials.base.to_string();
@@ -1159,6 +1447,58 @@ impl MusicApp {
     fn process_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.receive.try_recv() {
             match event {
+                Event::UpdateChecked(epoch, result) if epoch == self.update.epoch => {
+                    self.update.phase = UpdatePhase::Idle;
+                    match result {
+                        Ok(Some(release)) => {
+                            self.update.release = Some(release);
+                            self.update.open = true;
+                            self.update.message = None;
+                        }
+                        Ok(None) => self.update.message = Some("当前已是最新正式版本".into()),
+                        Err(error) => self.update.message = Some(error),
+                    }
+                }
+                Event::UpdateProgress(epoch, received, total) if epoch == self.update.epoch => {
+                    self.update.progress = (received, total);
+                }
+                Event::UpdateDownloaded(epoch, result) if epoch == self.update.epoch => {
+                    self.update.cancel = None;
+                    match result {
+                        Ok(staged) => {
+                            self.update.phase = UpdatePhase::Installing;
+                            let root = self.vault.updates();
+                            let events = self.events.clone();
+                            self.runtime.spawn_blocking(move || {
+                                events.send(Event::UpdateInstallerReady(
+                                    epoch,
+                                    updater::launch_installer(staged, root),
+                                ));
+                            });
+                        }
+                        Err(error) => {
+                            self.update.phase = UpdatePhase::Idle;
+                            self.update.message = Some(error);
+                            self.update.open = true;
+                        }
+                    }
+                }
+                Event::UpdateInstallerReady(epoch, result) if epoch == self.update.epoch => {
+                    match result {
+                        Ok(()) => {
+                            self.update_media();
+                            self.persist();
+                            self.stop_media();
+                            self.exiting = true;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        Err(error) => {
+                            self.update.phase = UpdatePhase::Idle;
+                            self.update.message = Some(error);
+                            self.update.open = true;
+                        }
+                    }
+                }
                 Event::Connected(result) => {
                     self.auth_busy = false;
                     match result {
@@ -1676,6 +2016,13 @@ impl MusicApp {
                         });
                     }
                 });
+                ui.add_space(14.0);
+                if ui
+                    .link(format!("v{} · 检查更新", updater::VERSION))
+                    .clicked()
+                {
+                    self.check_updates(true);
+                }
                 if self.auth_busy {
                     ui.add_space(12.0);
                     ui.spinner();
@@ -3529,6 +3876,25 @@ impl eframe::App for MusicApp {
         super::motion::configure(ctx, self.preferences.animation_mode);
         self.refresh_system_appearance(ctx);
         super::motion::update_theme(ctx);
+        if let Some(ack) = self.update.startup_ack.take() {
+            updater::acknowledge_startup(&self.vault.updates(), &ack);
+        }
+        if self
+            .update
+            .automatic_due
+            .is_some_and(|due| Instant::now() >= due)
+        {
+            self.update.automatic_due = None;
+            if self.preferences.auto_check_updates {
+                self.check_updates(false);
+            }
+        }
+        if !self.exiting
+            && self.update.phase == UpdatePhase::Installing
+            && ctx.input(|input| input.viewport().close_requested())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         if self.logging_out && ctx.input(|input| input.viewport().close_requested()) {
             self.close_after_logout = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -3538,9 +3904,11 @@ impl eframe::App for MusicApp {
         self.update_desktop(ctx);
         self.title_bar(ctx);
         self.appearance_window(ctx);
+        self.update_window(ctx);
         if !self.exiting
             && !self.logging_out
             && self.close_to_tray
+            && self.update.phase != UpdatePhase::Installing
             && self.desktop.as_ref().is_some_and(Desktop::has_tray)
             && ctx.input(|input| input.viewport().close_requested())
         {

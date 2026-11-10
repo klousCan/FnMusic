@@ -1,6 +1,6 @@
 [package]
 name = "fnmusic"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 
@@ -20,6 +20,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 url = { version = "2", features = ["serde"] }
 
 [target.'cfg(windows)'.dependencies]
+semver = "1"
 eframe = { version = "0.31.1", default-features = false, features = ["accesskit", "default_fonts", "glow"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 resvg = { version = "0.45", default-features = false }
