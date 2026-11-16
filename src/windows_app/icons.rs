@@ -10,6 +10,7 @@ pub enum Icon {
     Music,
     Albums,
     Artist,
+    Playlist,
     Queue,
     Heart,
     Search,
@@ -318,6 +319,13 @@ fn paint(ui: &Ui, center: Pos2, icon: Icon, color: Color32, selected: bool) {
                 (7.0, 7.0),
             ]);
         }
+        Icon::Playlist => {
+            line(&[(-7.0, -6.0), (6.0, -6.0)]);
+            line(&[(-7.0, -2.0), (0.0, -2.0)]);
+            line(&[(-7.0, 2.0), (-3.0, 2.0)]);
+            line(&[(5.0, 6.0), (5.0, -1.0), (8.0, 0.5)]);
+            painter.circle_stroke(p(3.0, 6.0), 2.0, stroke);
+        }
         Icon::Queue => {
             for y in [-5.0, 0.0, 5.0] {
                 line(&[(-3.0, y), (7.0, y)]);
@@ -524,6 +532,9 @@ fn tabler_body(icon: Icon) -> &'static str {
             r#"<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="12" cy="12" r="3"/><path d="M12 3v6"/>"#
         }
         Icon::Artist => r#"<circle cx="12" cy="7" r="4"/><path d="M5.5 21a7 7 0 0 1 13 0"/>"#,
+        Icon::Playlist => {
+            r#"<path d="M3 5h16M3 10h9M3 15h5M18 18V10l3 1.5"/><ellipse cx="15.5" cy="18" rx="2.5" ry="2"/>"#
+        }
         Icon::Queue => r#"<path d="M4 6h12M4 12h12M4 18h8"/><path d="M19 16v6M16 19h6"/>"#,
         Icon::Heart => {
             r#"<path d="M12 20l-7 -7a4 4 0 0 1 5.5 -5.8l1.5 1.4l1.5 -1.4a4 4 0 0 1 5.5 5.8z"/>"#

@@ -116,6 +116,123 @@ pub fn paint(ui: &egui::Ui, rect: Rect, texture: Option<&TextureHandle>, seed: &
     );
 }
 
+pub fn paint_record(
+    ui: &egui::Ui,
+    rect: Rect,
+    texture: Option<&TextureHandle>,
+    seed: &str,
+    angle: f32,
+) {
+    use egui::{Stroke, epaint::Mesh, vec2};
+    use std::f32::consts::TAU;
+
+    let painter = ui.painter().with_clip_rect(rect);
+    let center = rect.center();
+    let radius = rect.width().min(rect.height()) * 0.473;
+    let label_radius = radius * 0.55;
+    for (offset, spread, alpha) in [(3.0, 5.0, 15), (3.5, 2.5, 22), (4.0, 0.0, 36)] {
+        painter.circle_filled(
+            center + vec2(0.0, offset),
+            radius + spread,
+            Color32::from_black_alpha(alpha),
+        );
+    }
+    painter.circle_filled(center, radius, Color32::from_rgb(18, 18, 22));
+
+    // The record turns under a fixed light, so the reflection stays in place.
+    const SEGMENTS: u32 = 96;
+    let mut sheen = Mesh::default();
+    for step in 0..=SEGMENTS {
+        let theta = TAU * step as f32 / SEGMENTS as f32;
+        let direction = Vec2::angled(theta);
+        let reflection = (theta + 0.8).cos().abs().powi(14);
+        let light = (reflection * 35.0) as u8;
+        sheen.colored_vertex(
+            center + direction * label_radius,
+            Color32::from_rgb(26 + light, 26 + light, 30 + light),
+        );
+        sheen.colored_vertex(
+            center + direction * (radius - 1.0),
+            Color32::from_rgb(17 + light, 17 + light, 21 + light),
+        );
+        if step > 0 {
+            let i = step * 2;
+            sheen.add_triangle(i - 2, i - 1, i);
+            sheen.add_triangle(i - 1, i + 1, i);
+        }
+    }
+    painter.add(egui::Shape::mesh(sheen));
+    for groove in 1..=20 {
+        let fraction = (groove as f32 - 0.4) / 21.0;
+        let r = egui::lerp(label_radius..=radius, fraction);
+        let alpha = if groove % 5 == 0 { 28 } else { 12 };
+        painter.circle_stroke(
+            center,
+            r,
+            Stroke::new(0.7_f32, Color32::from_white_alpha(alpha)),
+        );
+    }
+    painter.circle_stroke(
+        center,
+        radius - 0.4,
+        Stroke::new(0.9_f32, Color32::from_white_alpha(53)),
+    );
+
+    if let Some(texture) = texture {
+        // Sample the centered square of the cover so non-square artwork keeps
+        // its proportions as it rotates within the circular label.
+        let size = texture.size_vec2();
+        let uv_scale = Vec2::splat(size.x.min(size.y) * 0.5) / size;
+        let mid_uv = egui::pos2(0.5, 0.5);
+        let mut label = Mesh::with_texture(texture.id());
+        label.vertices.push(egui::epaint::Vertex {
+            pos: center,
+            uv: mid_uv,
+            color: Color32::WHITE,
+        });
+        for step in 0..=SEGMENTS {
+            let theta = TAU * step as f32 / SEGMENTS as f32;
+            label.vertices.push(egui::epaint::Vertex {
+                pos: center + Vec2::angled(theta) * label_radius,
+                uv: mid_uv + Vec2::angled(theta - angle) * uv_scale,
+                color: Color32::WHITE,
+            });
+            if step > 0 {
+                label.add_triangle(0, step, step + 1);
+            }
+        }
+        painter.add(egui::Shape::mesh(label));
+    } else {
+        let (background, foreground) = placeholder_colors(true, seed);
+        painter.circle_filled(center, label_radius, background);
+        let direction = Vec2::angled(angle - TAU * 0.25);
+        painter.circle_filled(
+            center + direction * (label_radius * 0.76),
+            label_radius * 0.06,
+            foreground,
+        );
+        painter.text(
+            center - vec2(0.0, label_radius * 0.33),
+            egui::Align2::CENTER_CENTER,
+            "♪",
+            egui::FontId::proportional((label_radius * 0.60).clamp(12.0, 58.0)),
+            foreground,
+        );
+    }
+    painter.circle_stroke(
+        center,
+        label_radius,
+        Stroke::new(1.0_f32, Color32::from_black_alpha(130)),
+    );
+    let hole = (radius * 0.039).max(2.0);
+    painter.circle_filled(center, hole, Color32::from_rgb(13, 13, 17));
+    painter.circle_stroke(
+        center,
+        hole,
+        Stroke::new(0.8_f32, Color32::from_white_alpha(100)),
+    );
+}
+
 fn placeholder_colors(dark: bool, seed: &str) -> (Color32, Color32) {
     let palettes = [
         Color32::from_rgb(171, 72, 99),

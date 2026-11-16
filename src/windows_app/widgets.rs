@@ -52,6 +52,65 @@ fn text(ui: &Ui, position: egui::Pos2, width: f32, value: &str, size: f32, color
     ui.painter().galley(position, galley, color);
 }
 
+pub const PLAYLIST_ROW_HEIGHT: f32 = 36.0;
+
+pub fn playlist_row(ui: &mut Ui, label: &str, selected: bool) -> (Response, egui::Rect) {
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), PLAYLIST_ROW_HEIGHT),
+        Sense::click(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            ui.is_enabled(),
+            selected,
+            label,
+        )
+    });
+    let thumbnail =
+        egui::Rect::from_center_size(rect.left_center() + vec2(20.0, 0.0), vec2(26.0, 26.0))
+            .round_to_pixels(ui.ctx().pixels_per_point());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.visuals();
+        let fill = if selected {
+            visuals.selection.bg_fill
+        } else {
+            visuals
+                .widgets
+                .hovered
+                .weak_bg_fill
+                .gamma_multiply(ui.ctx().animate_bool(
+                    response.id.with("hover"),
+                    response.hovered() || response.has_focus(),
+                ))
+        };
+        ui.painter().rect_filled(rect, 8, fill);
+        if response.has_focus() {
+            ui.painter().rect_stroke(
+                rect.shrink(0.5),
+                8,
+                Stroke::new(1.0_f32, visuals.hyperlink_color),
+                StrokeKind::Inside,
+            );
+        }
+        let title_left = thumbnail.right() + 9.0;
+        text(
+            ui,
+            pos2(title_left, rect.center().y),
+            rect.right() - title_left - 8.0,
+            label,
+            13.0,
+            visuals.text_color(),
+        );
+    }
+    (
+        response
+            .on_hover_text(label)
+            .on_hover_cursor(egui::CursorIcon::PointingHand),
+        thumbnail,
+    )
+}
+
 pub fn action(
     ui: &mut Ui,
     icon: Icon,

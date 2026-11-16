@@ -335,6 +335,14 @@ async fn tracks(
     cover: &str,
 ) -> Result<Listing> {
     let (list, has_more) = rows::<RawTrack>(session, path, query, page, size).await?;
+    Ok(Listing {
+        tracks: map_tracks_with_covers(session, list, cover).await,
+        has_more,
+        ..Listing::default()
+    })
+}
+
+async fn map_tracks_with_covers(session: &Session, list: Vec<RawTrack>, cover: &str) -> Vec<Track> {
     let mut tracks = Vec::new();
     let mut missing = Vec::new();
     for item in list {
@@ -351,11 +359,7 @@ async fn tracks(
         }
     }
     fill_track_covers(session, &mut tracks, &missing).await;
-    Ok(Listing {
-        tracks,
-        has_more,
-        ..Listing::default()
-    })
+    tracks
 }
 
 async fn fill_track_covers(session: &Session, tracks: &mut [Track], missing: &[(usize, String)]) {
@@ -651,6 +655,29 @@ pub async fn load(session: &Session, page: &Page, number: u32) -> Result<Listing
             })
         }
     }
+}
+
+pub async fn playlist_cover_candidates(session: &Session, id: &str) -> Result<Vec<String>> {
+    let (mut rows, _) = rows::<RawTrack>(
+        session,
+        "/api/v1/track/playlist-detail/list",
+        &[("playlistGUID", id)],
+        1,
+        "6",
+    )
+    .await?;
+    for track in &mut rows {
+        if track.cover_id == track.guid {
+            track.cover_id.clear();
+        }
+    }
+    let mut covers = Vec::new();
+    for track in map_tracks_with_covers(session, rows, "").await {
+        if !track.cover.is_empty() && !covers.contains(&track.cover) {
+            covers.push(track.cover);
+        }
+    }
+    Ok(covers)
 }
 
 pub async fn add_playlist_tracks(session: &Session, id: &str, tracks: &[String]) -> Result<()> {

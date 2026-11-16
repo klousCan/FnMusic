@@ -110,6 +110,12 @@ impl Media {
         })
     }
 
+    pub fn is_playing(&self) -> bool {
+        self.session
+            .PlaybackState()
+            .is_ok_and(|state| state == MediaPlaybackState::Playing)
+    }
+
     pub fn volume(&self, volume: f32) -> Result<()> {
         self.player.SetVolume(f64::from(volume))
     }

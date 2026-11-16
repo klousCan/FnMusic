@@ -36,6 +36,7 @@ pub(super) const ACCENT: Color32 = Color32::from_rgb(235, 54, 87);
 const COVER_CAPACITY: usize = 240;
 const SIDEBAR_BREAKPOINT: f32 = 980.0;
 const PANEL_BREAKPOINT: f32 = 1240.0;
+const TITLE_BAR_HEIGHT: f32 = 48.0;
 const HISTORY_LIMIT: usize = 40;
 
 struct HistoryEntry {
@@ -66,6 +67,7 @@ enum Event {
     Cover(u64, String, Option<(egui::ColorImage, Color32)>),
     Favorite(u64, String, bool, api::Result<()>),
     SidebarPlaylists(u64, api::Result<Listing>),
+    SidebarPlaylistCovers(u64, String, Instant, api::Result<Vec<String>>),
     PlaylistUpdated(u64, Collection, api::Result<()>),
 }
 
@@ -86,6 +88,12 @@ enum Cover {
     Ready(TextureHandle, u64, Color32),
     Pending,
     Missing(Instant),
+}
+
+enum SidebarPlaylistCover {
+    Loading(Instant),
+    Ready(Vec<String>),
+    Retry(Instant),
 }
 
 #[derive(PartialEq, Eq)]
@@ -221,10 +229,12 @@ pub struct MusicApp {
     search_focus: bool,
     sidebar_collapsed: bool,
     sidebar_playlists: Vec<Collection>,
+    sidebar_playlist_covers: HashMap<String, SidebarPlaylistCover>,
     playlist_pending: HashSet<String>,
     panel: Panel,
     lyrics_detail: bool,
     detail_lyrics_enabled: bool,
+    detail_record: super::motion::RecordRotation,
     covers: HashMap<String, Cover>,
     cover_limit: Arc<Semaphore>,
     cover_clock: u64,
@@ -1042,10 +1052,12 @@ impl MusicApp {
             search_focus: false,
             sidebar_collapsed: false,
             sidebar_playlists: Vec::new(),
+            sidebar_playlist_covers: HashMap::new(),
             playlist_pending: HashSet::new(),
             panel: Panel::None,
             lyrics_detail: false,
             detail_lyrics_enabled: true,
+            detail_record: super::motion::RecordRotation::default(),
             covers: HashMap::new(),
             cover_limit: Arc::new(Semaphore::new(3)),
             cover_clock: 0,
@@ -1221,6 +1233,7 @@ impl MusicApp {
         self.search_due = None;
         self.search_focus = false;
         self.sidebar_playlists.clear();
+        self.sidebar_playlist_covers.clear();
         self.playlist_pending.clear();
         self.panel = Panel::None;
         self.lyrics_detail = false;
@@ -1610,6 +1623,60 @@ impl MusicApp {
         }
     }
 
+    fn sidebar_playlist_image(
+        &mut self,
+        ui: &egui::Ui,
+        playlist: &Collection,
+    ) -> Option<TextureHandle> {
+        // The playlist API can return a bare track GUID instead of a cover ID.
+        if playlist.cover.contains('_') {
+            let primary = self.cover(&playlist.cover).cloned();
+            if primary.is_some()
+                || !matches!(self.covers.get(&playlist.cover), Some(Cover::Missing(_)))
+            {
+                return primary;
+            }
+        }
+        let now = Instant::now();
+        match self.sidebar_playlist_covers.get(&playlist.id) {
+            Some(SidebarPlaylistCover::Ready(ids)) => {
+                for id in ids.clone() {
+                    if id == playlist.cover && id.contains('_') {
+                        continue;
+                    }
+                    if let Some(Cover::Missing(retry)) = self.covers.get(&id)
+                        && *retry > now
+                    {
+                        ui.ctx().request_repaint_after(*retry - now);
+                        continue;
+                    }
+                    return self.cover(&id).cloned();
+                }
+            }
+            Some(SidebarPlaylistCover::Loading(_)) => {}
+            Some(SidebarPlaylistCover::Retry(retry)) if *retry > now => {
+                ui.ctx().request_repaint_after(*retry - now);
+            }
+            _ => {
+                if let Some(session) = self.session.clone()
+                    && let Ok(permit) = self.cover_limit.clone().try_acquire_owned()
+                {
+                    self.sidebar_playlist_covers
+                        .insert(playlist.id.clone(), SidebarPlaylistCover::Loading(now));
+                    let id = playlist.id.clone();
+                    let events = self.events.clone();
+                    let epoch = self.session_epoch;
+                    self.runtime.spawn(async move {
+                        let result = library::playlist_cover_candidates(&session, &id).await;
+                        drop(permit);
+                        events.send(Event::SidebarPlaylistCovers(epoch, id, now, result));
+                    });
+                }
+            }
+        }
+        None
+    }
+
     fn process_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.receive.try_recv() {
             match event {
@@ -1838,10 +1905,26 @@ impl MusicApp {
                 Event::SidebarPlaylists(epoch, Ok(listing)) if epoch == self.session_epoch => {
                     self.sidebar_playlists = listing.playlists;
                 }
+                Event::SidebarPlaylistCovers(epoch, id, requested, result)
+                    if epoch == self.session_epoch
+                        && matches!(
+                            self.sidebar_playlist_covers.get(&id),
+                            Some(SidebarPlaylistCover::Loading(started)) if *started == requested
+                        ) =>
+                {
+                    let cover = match result {
+                        Ok(ids) => SidebarPlaylistCover::Ready(ids),
+                        Err(_) => {
+                            SidebarPlaylistCover::Retry(Instant::now() + Duration::from_secs(30))
+                        }
+                    };
+                    self.sidebar_playlist_covers.insert(id, cover);
+                }
                 Event::PlaylistUpdated(epoch, playlist, result) if epoch == self.session_epoch => {
                     self.playlist_pending.remove(&playlist.id);
                     match result {
                         Ok(()) => {
+                            self.sidebar_playlist_covers.remove(&playlist.id);
                             let matches_playlist = |page: &Page| matches!(page, Page::Detail(item) if item.kind == Kind::Playlist && item.id == playlist.id);
                             for entry in self.previous.iter_mut().chain(&mut self.forward) {
                                 if matches_playlist(&entry.page) {
@@ -2328,25 +2411,8 @@ impl MusicApp {
             .resizable(false)
             .frame(Frame::new().fill(fill).inner_margin(12))
             .show(ctx, |ui| {
-                ui.add_space(9.0);
-                ui.add_space(3.0);
-                if compact {
-                    if icons::button(
-                        ui,
-                        Icon::Search,
-                        "搜索（Ctrl+F）",
-                        None,
-                        false,
-                        Vec2::new(ui.available_width(), 32.0),
-                    )
-                    .clicked()
-                    {
-                        self.search_focus = true;
-                        ctx.request_repaint();
-                    }
-                } else {
-                    self.search_field(ui, ui.available_width());
-                    ui.add_space(10.0);
+                ui.add_space(4.0);
+                if !compact {
                     ui.label(RichText::new("资料库").small().weak().strong());
                 }
                 ui.add_space(4.0);
@@ -2357,7 +2423,7 @@ impl MusicApp {
                     (Page::Tracks, Icon::Music),
                     (Page::Albums, Icon::Albums),
                     (Page::Artists, Icon::Artist),
-                    (Page::Playlists, Icon::Queue),
+                    (Page::Playlists, Icon::Playlist),
                     (Page::Favorites, Icon::Heart),
                 ] {
                     let label = page.title();
@@ -2403,19 +2469,28 @@ impl MusicApp {
                     egui::ScrollArea::vertical()
                         .id_salt("sidebar-playlists")
                         .max_height(ui.available_height() - 72.0)
-                        .show_rows(ui, 29.0, self.sidebar_playlists.len(), |ui, rows| {
+                        .show_rows(ui, widgets::PLAYLIST_ROW_HEIGHT, self.sidebar_playlists.len(), |ui, rows| {
                             for index in rows {
                                 let playlist = self.sidebar_playlists[index].clone();
                                 let selected =
                                     matches!(&self.page, Page::Detail(item) if item == &playlist);
-                                let response = icons::button(
-                                    ui,
-                                    Icon::Queue,
-                                    &playlist.title,
-                                    Some(&playlist.title),
-                                    selected,
-                                    Vec2::new(ui.available_width(), 29.0),
-                                );
+                                let (response, thumbnail) = widgets::playlist_row(ui, &playlist.title, selected);
+                                if ui.is_rect_visible(thumbnail) {
+                                    if let Some(texture) = self.sidebar_playlist_image(ui, &playlist) {
+                                        let source = texture.size_vec2();
+                                        let uv = egui::Rect::from_center_size(
+                                            egui::pos2(0.5, 0.5),
+                                            Vec2::splat(source.x.min(source.y)) / source,
+                                        );
+                                        egui::Image::new((texture.id(), thumbnail.size()))
+                                            .uv(uv)
+                                            .corner_radius(5)
+                                            .paint_at(ui, thumbnail);
+                                    } else {
+                                        ui.painter().rect_filled(thumbnail, 5, ui.visuals().faint_bg_color);
+                                        icons::glyph(ui, thumbnail.center(), Icon::Playlist, widgets::secondary_text(ui));
+                                    }
+                                }
                                 if let Some(payload) = track_drop(ui, &response, self.session_epoch)
                                 {
                                     self.add_to_playlist(playlist.clone(), &payload.tracks);
@@ -2430,23 +2505,23 @@ impl MusicApp {
                 }
                 ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
                     self.account_menu(ui, compact);
-                    ui.separator();
+                    ui.add_space(8.0);
                 });
             });
     }
 
     fn search_field(&mut self, ui: &mut egui::Ui, width: f32) {
         let id = egui::Id::new("library-search");
-        let (rect, hit) = ui.allocate_exact_size(Vec2::new(width, 34.0), egui::Sense::click());
+        let (rect, hit) = ui.allocate_exact_size(Vec2::new(width, 32.0), egui::Sense::click());
         let focused = ui.memory(|memory| memory.has_focus(id));
         let fill = super::motion::themed_color(
             ui.ctx(),
-            Color32::from_rgb(235, 235, 240),
-            Color32::from_rgb(35, 36, 41),
+            Color32::from_rgb(230, 230, 235),
+            Color32::from_rgb(42, 43, 49),
         );
         ui.painter().rect(
             rect,
-            10.0,
+            9.0,
             fill,
             egui::Stroke::new(
                 if focused { 1.5_f32 } else { 1.0_f32 },
@@ -2473,7 +2548,7 @@ impl MusicApp {
                 .id_salt("library-search-field")
                 .max_rect(egui::Rect::from_min_max(
                     egui::pos2(rect.left() + 30.0, rect.top()),
-                    rect.max,
+                    rect.max - egui::vec2(10.0, 0.0),
                 ))
                 .layout(Layout::left_to_right(Align::Center)),
         );
@@ -2481,8 +2556,8 @@ impl MusicApp {
             egui::TextEdit::singleline(&mut self.search)
                 .id(id)
                 .frame(false)
-                .desired_width((rect.width() - 54.0).max(18.0))
-                .hint_text("搜索歌曲、专辑或艺人"),
+                .desired_width((rect.width() - 40.0).max(18.0))
+                .hint_text("搜索音乐"),
         );
         if hit.clicked() {
             field.request_focus();
@@ -3243,11 +3318,12 @@ impl MusicApp {
     fn player_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("player")
             .exact_height(104.0)
+            .show_separator_line(false)
             .frame(
                 Frame::new()
                     .fill(super::motion::themed_color(
                         ctx,
-                        Color32::from_rgb(250, 250, 252),
+                        Color32::from_rgb(243, 243, 247),
                         Color32::from_rgb(20, 20, 23),
                     ))
                     .inner_margin(12),
@@ -3601,7 +3677,7 @@ impl MusicApp {
         }
     }
 
-    fn lyrics_detail_view(&mut self, ctx: &egui::Context) {
+    fn lyrics_detail_view(&mut self, ctx: &egui::Context, record_angle: f32) {
         let Some(track) = self.queue.current().cloned() else {
             return;
         };
@@ -3647,11 +3723,20 @@ impl MusicApp {
                             .max_rect(rect)
                             .layout(Layout::top_down(Align::Min)),
                         |ui| {
-                            // Keep the entire transport group on screen. In a
-                            // short window the old cover cap consumed the space
-                            // reserved for progress and volume controls.
+                            // Leave room below the record for the playback controls.
                             ui.set_width(size);
-                            self.art(ui, &track.cover, &track.title, size);
+                            let (record_rect, _) =
+                                ui.allocate_exact_size(artwork::square(size), egui::Sense::hover());
+                            if ui.is_rect_visible(record_rect) {
+                                let texture = self.cover(&track.cover);
+                                artwork::paint_record(
+                                    ui,
+                                    record_rect,
+                                    texture,
+                                    &track.title,
+                                    record_angle,
+                                );
+                            }
                             ui.add_space(18.0);
                             ui.horizontal(|ui| {
                                 ui.allocate_ui_with_layout(
@@ -3820,44 +3905,24 @@ impl MusicApp {
             return;
         }
         let active = playback::active_lyric(&self.lyrics, self.queue.position_ms);
-        let mut seek = None;
         let resumed = lyric_follow_ui(ui, &mut self.detail_follow);
-        let follow = self.detail_follow.following();
-        egui::ScrollArea::vertical()
+        let scroll_to_active =
+            self.detail_follow.following() && (resumed || active != self.last_lyric);
+        let seek = egui::ScrollArea::vertical()
             .id_salt(("detail_lyric_lines", self.track_epoch))
             .max_height(ui.available_height().max(100.0))
             .show(ui, |ui| {
                 ui.set_width((ui.available_width() - 12.0).max(0.0));
-                for (index, line) in self.lyrics.iter().enumerate() {
-                    let current = active == Some(index);
-                    let emphasis = ui.ctx().animate_bool(
-                        ui.id().with((self.track_epoch, index, "lyric-active")),
-                        current,
-                    );
-                    let text = RichText::new(&line.text)
-                        .size(22.0 + 8.0 * emphasis)
-                        .color(
-                            ui.visuals()
-                                .weak_text_color()
-                                .lerp_to_gamma(ui.visuals().text_color(), emphasis),
-                        )
-                        .strong();
-                    let row = ui.add(egui::Label::new(text).wrap().sense(
-                        if line.position_ms.is_some() {
-                            egui::Sense::click()
-                        } else {
-                            egui::Sense::hover()
-                        },
-                    ));
-                    if row.clicked() {
-                        seek = line.position_ms;
-                    }
-                    if follow && current && (resumed || active != self.last_lyric) {
-                        row.scroll_to_me(Some(Align::Center));
-                    }
-                    ui.add_space(if current { 22.0 } else { 16.0 });
-                }
-            });
+                lyric_rows(
+                    ui,
+                    &self.lyrics,
+                    active,
+                    scroll_to_active,
+                    [22.0, 30.0],
+                    ui.visuals().text_color(),
+                )
+            })
+            .inner;
         self.last_lyric = active;
         if let Some(position) = seek {
             self.detail_follow.resume();
@@ -4207,42 +4272,22 @@ impl MusicApp {
             ui.label(RichText::new("暂无歌词").weak());
         } else {
             let active = playback::active_lyric(&self.lyrics, self.queue.position_ms);
-            let mut seek = None;
             let resumed = lyric_follow_ui(ui, &mut self.sidebar_follow);
-            let follow = self.sidebar_follow.following();
-            egui::ScrollArea::vertical()
+            let scroll_to_active =
+                self.sidebar_follow.following() && (resumed || active != self.last_lyric);
+            let seek = egui::ScrollArea::vertical()
                 .id_salt(("lyric_lines", self.track_epoch))
                 .show(ui, |ui| {
-                    for (index, line) in self.lyrics.iter().enumerate() {
-                        let text = RichText::new(&line.text).size(if active == Some(index) {
-                            20.0
-                        } else {
-                            16.0
-                        });
-                        let text = if active == Some(index) {
-                            text.color(ui.visuals().hyperlink_color).strong()
-                        } else {
-                            text
-                        };
-                        let label =
-                            egui::Label::new(text)
-                                .wrap()
-                                .sense(if line.position_ms.is_some() {
-                                    egui::Sense::click()
-                                } else {
-                                    egui::Sense::hover()
-                                });
-                        let row = ui.add(label);
-                        if row.clicked() {
-                            seek = line.position_ms;
-                        }
-                        if follow && active == Some(index) && (resumed || active != self.last_lyric)
-                        {
-                            row.scroll_to_me(Some(Align::Center));
-                        }
-                        ui.add_space(10.0);
-                    }
-                });
+                    lyric_rows(
+                        ui,
+                        &self.lyrics,
+                        active,
+                        scroll_to_active,
+                        [16.0, 20.0],
+                        ui.visuals().hyperlink_color,
+                    )
+                })
+                .inner;
             self.last_lyric = active;
             if let Some(position) = seek {
                 self.sidebar_follow.resume();
@@ -4334,113 +4379,102 @@ impl MusicApp {
     fn title_bar(&mut self, ctx: &egui::Context) {
         let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
         let library = self.session.is_some() && !self.lyrics_detail;
-        let compact = self.sidebar_collapsed || ctx.screen_rect().width() < SIDEBAR_BREAKPOINT;
-        let sidebar_width = if library {
-            self.sidebar_width(ctx)
-        } else {
-            0.0
-        };
+        let wide = ctx.screen_rect().width() >= SIDEBAR_BREAKPOINT;
         let background = if self.lyrics_detail {
             self.detail_background(ctx)
         } else {
             ctx.style().visuals.panel_fill
         };
+        if library && ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::F))
+        {
+            self.search_focus = true;
+        }
+
         egui::TopBottomPanel::top("custom-title-bar")
-            .exact_height(40.0)
+            .exact_height(TITLE_BAR_HEIGHT)
             .resizable(false)
+            .show_separator_line(false)
             .frame(Frame::new().fill(background).inner_margin(0.0))
             .show(ctx, |ui| {
-                if library {
-                    let mut sidebar_rect = ui.max_rect();
-                    sidebar_rect.set_width(sidebar_width);
-                    ui.painter()
-                        .rect_filled(sidebar_rect, 0.0, Self::sidebar_background(ctx));
-                }
+                let bar = ui.max_rect();
+                let body = bar.shrink2(egui::vec2(12.0, 4.0));
+                let surface = ui.visuals().widgets.noninteractive.bg_stroke.color;
+                ui.painter()
+                    .rect_filled(body, 10, surface.gamma_multiply(0.22));
                 ui.allocate_ui_with_layout(
                     ui.available_size(),
                     Layout::left_to_right(Align::Center),
                     |ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.add_space(16.0);
                         if library {
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(sidebar_width, 40.0),
-                                Layout::left_to_right(Align::Center),
-                                |ui| {
-                                    ui.set_width(sidebar_width);
-                                    ui.spacing_mut().item_spacing.x = 0.0;
-                                    if titlebar_button(
-                                        ui,
-                                        Icon::Sidebar,
-                                        if compact {
-                                            "显示侧边栏（Ctrl+B）"
-                                        } else {
-                                            "隐藏侧边栏（Ctrl+B）"
-                                        },
-                                        false,
-                                        ctx.screen_rect().width() >= SIDEBAR_BREAKPOINT,
-                                        64.0,
-                                    ) {
-                                        self.sidebar_collapsed = !self.sidebar_collapsed;
-                                        ctx.request_repaint();
-                                    }
-                                    if sidebar_width >= 150.0 {
-                                        ui.label(RichText::new("飞牛音乐").size(14.0).strong());
-                                    }
-                                },
-                            );
-                            ui.add_space(10.0);
-                        } else {
-                            ui.add_space(16.0);
-                        }
-
-                        if self.session.is_some() {
+                            let sidebar_label = if self.sidebar_collapsed {
+                                "显示侧边栏（Ctrl+B）"
+                            } else {
+                                "隐藏侧边栏（Ctrl+B）"
+                            };
+                            if titlebar_button(ui, Icon::Sidebar, sidebar_label, false, wide, 36.0)
+                            {
+                                self.sidebar_collapsed = !self.sidebar_collapsed;
+                                ctx.request_repaint();
+                            }
+                            ui.add_space(8.0);
                             if titlebar_button(
                                 ui,
                                 Icon::Back,
-                                if self.lyrics_detail {
-                                    "退出播放详情（Esc）"
-                                } else {
-                                    "后退（Alt+←）"
-                                },
+                                "后退（Alt+←）",
                                 false,
-                                self.lyrics_detail || !self.previous.is_empty(),
+                                !self.previous.is_empty(),
+                                32.0,
+                            ) {
+                                self.travel(false);
+                            }
+                            if titlebar_button(
+                                ui,
+                                Icon::Forward,
+                                "前进（Alt+→）",
+                                false,
+                                !self.forward.is_empty(),
+                                32.0,
+                            ) {
+                                self.travel(true);
+                            }
+
+                            ui.add_space(12.0);
+                            self.search_field(ui, (bar.width() * 0.29).clamp(160.0, 280.0));
+                            ui.add_space(8.0);
+                            if titlebar_button(
+                                ui,
+                                Icon::Refresh,
+                                "刷新",
+                                false,
+                                !self.loading,
                                 34.0,
                             ) {
-                                if self.lyrics_detail {
-                                    self.lyrics_detail = false;
-                                    self.last_lyric = None;
-                                } else {
-                                    self.travel(false);
-                                }
+                                self.open_page(self.page.clone(), false);
                             }
-                            if library {
-                                if titlebar_button(
-                                    ui,
-                                    Icon::Forward,
-                                    "前进（Alt+→）",
-                                    false,
-                                    !self.forward.is_empty(),
-                                    34.0,
-                                ) {
-                                    self.travel(true);
-                                }
-                                if titlebar_button(
-                                    ui,
-                                    Icon::Refresh,
-                                    "刷新",
-                                    false,
-                                    !self.loading,
-                                    34.0,
-                                ) {
-                                    self.open_page(self.page.clone(), false);
-                                }
-                            }
+                            ui.add_space(8.0);
+                        } else if self.lyrics_detail
+                            && titlebar_button(
+                                ui,
+                                Icon::Back,
+                                "退出播放详情（Esc）",
+                                false,
+                                true,
+                                36.0,
+                            )
+                        {
+                            self.lyrics_detail = false;
+                            self.last_lyric = None;
                         }
 
-                        let search_width = if library && compact { 193.0 } else { 0.0 };
-                        let drag_width = (ui.available_width() - 140.0 - search_width).max(0.0);
+                        const WINDOW_BUTTON_WIDTH: f32 = 40.0;
+                        const RIGHT_PADDING: f32 = 16.0;
+                        let drag_width =
+                            (ui.available_width() - 3.0 * WINDOW_BUTTON_WIDTH - RIGHT_PADDING)
+                                .max(0.0);
                         let (rect, drag) = ui.allocate_exact_size(
-                            Vec2::new(drag_width, 40.0),
+                            Vec2::new(drag_width, TITLE_BAR_HEIGHT),
                             egui::Sense::click_and_drag(),
                         );
                         let title = if self.lyrics_detail {
@@ -4454,16 +4488,18 @@ impl MusicApp {
                             } else {
                                 String::new()
                             }
-                        } else {
+                        } else if self.session.is_none() {
                             "飞牛音乐".to_owned()
+                        } else {
+                            String::new()
                         };
                         paint_track_text(
                             ui,
-                            rect.left() + 4.0,
+                            rect.left() + 6.0,
                             rect.center().y,
-                            rect.width() - 8.0,
+                            (rect.width() - 12.0).max(0.0),
                             &title,
-                            ui.visuals().weak_text_color(),
+                            widgets::secondary_text(ui),
                             13.0,
                         );
                         if drag.drag_started() {
@@ -4472,34 +4508,40 @@ impl MusicApp {
                         if drag.double_clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
                         }
-                        if search_width > 0.0 {
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(185.0, 34.0),
-                                Layout::left_to_right(Align::Center),
-                                |ui| self.search_field(ui, 185.0),
-                            );
-                            ui.add_space(8.0);
-                        }
 
-                        if titlebar_button(ui, Icon::WindowMinimize, "最小化", false, true, 46.0)
-                        {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                        }
                         if titlebar_button(
                             ui,
-                            if maximized {
-                                Icon::WindowRestore
-                            } else {
-                                Icon::WindowMaximize
-                            },
-                            if maximized { "还原" } else { "最大化" },
+                            Icon::WindowMinimize,
+                            "最小化",
                             false,
                             true,
-                            46.0,
+                            WINDOW_BUTTON_WIDTH,
+                        ) {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
+                        let (resize_icon, resize_label) = if maximized {
+                            (Icon::WindowRestore, "还原")
+                        } else {
+                            (Icon::WindowMaximize, "最大化")
+                        };
+                        if titlebar_button(
+                            ui,
+                            resize_icon,
+                            resize_label,
+                            false,
+                            true,
+                            WINDOW_BUTTON_WIDTH,
                         ) {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
                         }
-                        if titlebar_button(ui, Icon::WindowClose, "关闭", true, true, 48.0) {
+                        if titlebar_button(
+                            ui,
+                            Icon::WindowClose,
+                            "关闭",
+                            true,
+                            true,
+                            WINDOW_BUTTON_WIDTH,
+                        ) {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     },
@@ -4533,21 +4575,16 @@ impl MusicApp {
         }
         let was_detail = self.lyrics_detail;
         if !was_detail {
-            let (back, forward, search, collapse) = ctx.input_mut(|input| {
+            let (back, forward, collapse) = ctx.input_mut(|input| {
                 let back = input.consume_key(egui::Modifiers::ALT, egui::Key::ArrowLeft)
                     || input.pointer.button_clicked(egui::PointerButton::Extra1);
                 let forward = input.consume_key(egui::Modifiers::ALT, egui::Key::ArrowRight)
                     || input.pointer.button_clicked(egui::PointerButton::Extra2);
-                let search = input.consume_key(egui::Modifiers::CTRL, egui::Key::F);
                 let collapse = input.consume_key(egui::Modifiers::CTRL, egui::Key::B);
-                (back, forward, search, collapse)
+                (back, forward, collapse)
             });
             if back || forward {
                 self.travel(!back);
-            }
-            self.search_focus |= search;
-            if search {
-                ctx.request_repaint();
             }
             if collapse && ctx.screen_rect().width() >= SIDEBAR_BREAKPOINT {
                 self.sidebar_collapsed = !self.sidebar_collapsed;
@@ -4565,8 +4602,15 @@ impl MusicApp {
         if was_detail != self.lyrics_detail {
             ctx.request_repaint();
         }
+        let turning = self.lyrics_detail
+            && ctx.style().animation_time > 0.0
+            && self.playing
+            && self.media_open
+            && !ctx.input(|input| input.viewport().minimized.unwrap_or(false))
+            && self.media.as_ref().is_some_and(Media::is_playing);
+        let record_angle = self.detail_record.advance(ctx, self.track_epoch, turning);
         if self.lyrics_detail {
-            self.lyrics_detail_view(ctx);
+            self.lyrics_detail_view(ctx, record_angle);
         } else {
             self.player_bar(ctx);
             self.side_content(ctx);
@@ -4603,7 +4647,9 @@ fn lyric_follow_ui(ui: &mut egui::Ui, follow: &mut LyricFollow) -> bool {
         input.pointer.hover_pos().is_some_and(|pointer| {
             region.contains(pointer)
                 && (input.raw_scroll_delta.y != 0.0
-                    || (input.pointer.primary_down() && input.pointer.delta().y != 0.0))
+                    || (input.pointer.primary_down()
+                        && input.pointer.is_decidedly_dragging()
+                        && input.pointer.delta().y != 0.0))
         })
     });
     if manual {
@@ -4612,6 +4658,88 @@ fn lyric_follow_ui(ui: &mut egui::Ui, follow: &mut LyricFollow) -> bool {
         ui.ctx().request_repaint();
     }
     resumed
+}
+
+fn lyric_rows(
+    ui: &mut egui::Ui,
+    lines: &[LyricLine],
+    active: Option<usize>,
+    scroll_to_active: bool,
+    sizes: [f32; 2],
+    highlight: Color32,
+) -> Option<u64> {
+    let motion = ui.style().animation_time > 0.0;
+    let scroll = if motion {
+        egui::style::ScrollAnimation::duration(0.40)
+    } else {
+        egui::style::ScrollAnimation::none()
+    };
+    let width = ui.available_width();
+    let indent = 8.0;
+    let wrap = (width - indent - 4.0).max(1.0);
+    let low = widgets::secondary_text(ui).lerp_to_gamma(ui.visuals().panel_fill, 0.22);
+    let mut seek = None;
+    for (index, line) in lines.iter().enumerate() {
+        let current = active == Some(index);
+        let layout = |ui: &egui::Ui, size| {
+            ui.painter().layout_job(egui::text::LayoutJob::simple(
+                line.text.clone(),
+                egui::FontId::proportional(size),
+                Color32::PLACEHOLDER,
+                wrap,
+            ))
+        };
+        // Reserve the largest text size so animating the text can't shift the scroll target.
+        let full = layout(ui, sizes[1]);
+        let timed = line.position_ms.is_some();
+        let (rect, row) = ui.allocate_exact_size(
+            Vec2::new(width, full.size().y.max(sizes[1]) + 12.0),
+            if timed {
+                egui::Sense::click()
+            } else {
+                egui::Sense::hover()
+            },
+        );
+        row.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                if timed {
+                    egui::WidgetType::Button
+                } else {
+                    egui::WidgetType::Label
+                },
+                ui.is_enabled(),
+                &line.text,
+            )
+        });
+        if timed && row.clicked() {
+            seek = line.position_ms;
+        }
+        if scroll_to_active && current {
+            row.scroll_to_me_animation(Some(Align::Center), scroll);
+        }
+        let emphasis = ui.ctx().animate_bool_with_time_and_easing(
+            row.id.with("lyric-emphasis"),
+            current,
+            ui.style().animation_time * 1.8,
+            egui::emath::easing::quadratic_out,
+        );
+        if ui.is_rect_visible(rect) {
+            let size = egui::lerp(sizes[0]..=sizes[1], emphasis).round();
+            let galley = if size == sizes[1] {
+                full
+            } else {
+                layout(ui, size)
+            };
+            let x = rect.left() + indent * emphasis;
+            let y = rect.center().y - galley.size().y * 0.5;
+            let position = egui::pos2(x, y).round_to_pixels(ui.ctx().pixels_per_point());
+            let color = low.lerp_to_gamma(highlight, emphasis);
+            ui.painter()
+                .with_clip_rect(rect)
+                .galley(position, galley, color);
+        }
+    }
+    seek
 }
 
 fn lyric_skeleton(ui: &mut egui::Ui) {
@@ -4634,7 +4762,9 @@ fn titlebar_button(
     width: f32,
 ) -> bool {
     ui.add_enabled_ui(enabled, |ui| {
-        let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 40.0), egui::Sense::click());
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 34.0), egui::Sense::click());
+        response
+            .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
         if ui.is_rect_visible(rect) {
             if response.hovered() || response.has_focus() || response.is_pointer_button_down_on() {
                 let fill = if close {
@@ -4644,10 +4774,10 @@ fn titlebar_button(
                 } else {
                     Color32::from_black_alpha(12)
                 };
-                ui.painter().rect_filled(rect.shrink(2.0), 5.0, fill);
+                ui.painter().rect_filled(rect.shrink(1.0), 8.0, fill);
             }
             let color = if !enabled {
-                ui.visuals().weak_text_color()
+                widgets::secondary_text(ui).gamma_multiply(0.48)
             } else if close && (response.hovered() || response.is_pointer_button_down_on()) {
                 Color32::WHITE
             } else {
@@ -4655,7 +4785,10 @@ fn titlebar_button(
             };
             icons::glyph(ui, rect.center(), icon, color);
         }
-        response.on_hover_text(label).clicked()
+        response
+            .on_hover_text(label)
+            .on_disabled_hover_text(label)
+            .clicked()
     })
     .inner
 }

@@ -1,6 +1,37 @@
 use super::vault::AnimationMode;
 use eframe::egui::{self, Id};
 
+#[derive(Default)]
+pub struct RecordRotation {
+    track_epoch: u64,
+    angle: f32,
+    last_frame: Option<f64>,
+}
+
+impl RecordRotation {
+    pub fn advance(&mut self, ctx: &egui::Context, track_epoch: u64, turning: bool) -> f32 {
+        if self.track_epoch != track_epoch {
+            *self = Self {
+                track_epoch,
+                ..Self::default()
+            };
+        }
+        if turning {
+            let now = ctx.input(|input| input.time);
+            if let Some(previous) = self.last_frame.replace(now) {
+                // Discard long gaps when Windows suspends painting the window.
+                let seconds = (now - previous).clamp(0.0, 0.08) as f32;
+                self.angle = (self.angle + seconds * std::f32::consts::TAU / 12.0)
+                    .rem_euclid(std::f32::consts::TAU);
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(24));
+        } else {
+            self.last_frame = None;
+        }
+        self.angle
+    }
+}
+
 #[derive(Clone)]
 struct ThemeTransition {
     from: egui::Visuals,
