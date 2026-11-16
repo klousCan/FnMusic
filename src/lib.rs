@@ -1,4 +1,5 @@
 pub mod api;
+pub mod audio;
 pub mod fn_connect;
 pub mod library;
 pub mod playback;

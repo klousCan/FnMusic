@@ -1,6 +1,6 @@
 # 飞牛音乐 · FnMusic
 
-FnMusic 是面向 Windows 10 22H2 和 Windows 11 x64 的第三方飞牛音乐桌面客户端。主窗口使用 Rust 和 egui，Windows MediaPlayer 负责音频解码与输出。WebView2 用于打开飞牛官方 NAS 账号授权页。
+FnMusic 是面向 Windows 10 22H2 和 Windows 11 x64 的第三方飞牛音乐桌面客户端。主窗口使用 Rust 和 egui，内置播放内核用 Symphonia 解码，通过 Rodio 和 CPAL 输出音频。WebView2 用于打开飞牛官方 NAS 账号授权页。
 
 ## 使用
 
@@ -35,7 +35,7 @@ FN Connect 连接使用官方公开网关解析 HTTPS 中继地址，NAS 必须�
 
 账户菜单和上述播放菜单提供「睡眠定时」：15／30／60／90 分钟后暂停，或本首结束后暂停。按分钟定时会保留播放进度，本首结束模式停在当前歌曲开头；定时仅本次运行有效，退出登录后取消。定时到期优先于自动切歌，播放列表显示剩余时间，可随时在菜单中关闭。
 
-需要 Windows x64、Rust stable MSVC 工具链、Visual Studio 的「使用 C++ 的桌面开发」构建工具与 Windows SDK。运行应用需要 Microsoft Edge WebView2 Runtime 和 Windows 媒体组件。Windows N 版可从系统设置添加 Media Feature Pack。
+需要 Windows x64、Rust stable MSVC 工具链、Visual Studio 的「使用 C++ 的桌面开发」构建工具与 Windows SDK。运行应用需要 Microsoft Edge WebView2 Runtime 和可用的音频输出设备。播放器自行解码 MP3、FLAC、AAC/M4A 和 WAV，通过 NAS 的 HTTP Range 支持拖动进度。
 
 ```powershell
 rustup default stable-x86_64-pc-windows-msvc

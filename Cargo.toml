@@ -1,6 +1,6 @@
 [package]
 name = "fnmusic"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 license = "MIT"
 
@@ -9,7 +9,8 @@ axum = "0.8"
 futures-util = "0.3"
 md5 = "0.7"
 rand = "0.9"
-reqwest = { version = "0.12", default-features = false, features = ["native-tls", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "json", "stream", "blocking"] }
+rodio = { version = "0.21.1", default-features = false, features = ["playback", "symphonia-all"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -28,7 +29,7 @@ tao = { version = "0.32", default-features = false, features = ["rwh_06"] }
 tray-icon = { version = "0.21", default-features = false }
 raw-window-handle = "0.6"
 webview2-com = "0.36"
-windows = { version = "0.60", features = ["Foundation", "Media", "Media_Control", "Media_Core", "Media_Playback", "Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WinRT", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.60", features = ["Foundation", "Media", "Media_Control", "Win32_Foundation", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WinRT", "Win32_UI_WindowsAndMessaging"] }
 wry = { version = "0.50", default-features = false }
 
 [target.'cfg(windows)'.dev-dependencies]

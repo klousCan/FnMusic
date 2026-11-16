@@ -2224,6 +2224,10 @@ impl MusicApp {
                     }
                 }
                 MediaEvent::Failed => self.media_failed(),
+                MediaEvent::SeekFailed => {
+                    self.position_hold = Instant::now();
+                    self.notice = Some("这首歌曲暂时无法跳转".into());
+                }
             }
         }
         if self.media_open

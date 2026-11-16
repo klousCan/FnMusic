@@ -1,13 +1,7 @@
-use std::sync::mpsc::{self, Receiver};
-
+pub use fnmusic::audio::{Media, MediaEvent};
 use windows::{
-    Foundation::{TimeSpan, TypedEventHandler, Uri},
-    Media::{
-        Core::MediaSource,
-        Playback::{MediaPlaybackSession, MediaPlaybackState, MediaPlayer},
-    },
     Win32::System::WinRT::{RO_INIT_SINGLETHREADED, RoInitialize, RoUninitialize},
-    core::{HSTRING, Result},
+    core::Result,
 };
 
 pub struct Apartment;
@@ -28,107 +22,6 @@ impl Drop for Apartment {
             RoUninitialize();
         }
     }
-}
-
-pub enum MediaEvent {
-    Opened,
-    Ended,
-    Failed,
-}
-
-pub struct Media {
-    player: MediaPlayer,
-    session: MediaPlaybackSession,
-    events: Receiver<MediaEvent>,
-}
-
-impl Media {
-    pub fn open(address: &str, volume: f32) -> Result<Self> {
-        let player = MediaPlayer::new()?;
-        let session = player.PlaybackSession()?;
-        let (send, events) = mpsc::channel();
-        let opened = send.clone();
-        let ended = send.clone();
-        player.MediaOpened(&TypedEventHandler::new(move |_, _| {
-            let _ = opened.send(MediaEvent::Opened);
-            Ok(())
-        }))?;
-        player.MediaEnded(&TypedEventHandler::new(move |_, _| {
-            let _ = ended.send(MediaEvent::Ended);
-            Ok(())
-        }))?;
-        player.MediaFailed(&TypedEventHandler::new(move |_, _| {
-            let _ = send.send(MediaEvent::Failed);
-            Ok(())
-        }))?;
-        player.SetAutoPlay(false)?;
-        player.CommandManager()?.SetIsEnabled(false)?;
-        player.SetVolume(f64::from(volume))?;
-        let uri = Uri::CreateUri(&HSTRING::from(address))?;
-        let source = MediaSource::CreateFromUri(&uri)?;
-        player.SetSource(&source)?;
-        Ok(Self {
-            player,
-            session,
-            events,
-        })
-    }
-
-    pub fn event(&self) -> Option<MediaEvent> {
-        self.events.try_recv().ok()
-    }
-
-    pub fn set_playing(&self, playing: bool) -> Result<()> {
-        if playing {
-            self.player.Play()
-        } else {
-            self.player.Pause()
-        }
-    }
-
-    pub fn seek(&self, ms: u64) -> Result<()> {
-        self.session.SetPosition(TimeSpan {
-            Duration: ms.min(i64::MAX as u64 / 10_000) as i64 * 10_000,
-        })
-    }
-
-    pub fn position(&self) -> Option<u64> {
-        self.session.Position().ok().map(milliseconds)
-    }
-
-    pub fn duration(&self) -> Option<u64> {
-        self.session
-            .NaturalDuration()
-            .ok()
-            .map(milliseconds)
-            .filter(|&ms| ms > 0)
-    }
-
-    pub fn buffering(&self) -> bool {
-        self.session.PlaybackState().is_ok_and(|state| {
-            state == MediaPlaybackState::Opening || state == MediaPlaybackState::Buffering
-        })
-    }
-
-    pub fn is_playing(&self) -> bool {
-        self.session
-            .PlaybackState()
-            .is_ok_and(|state| state == MediaPlaybackState::Playing)
-    }
-
-    pub fn volume(&self, volume: f32) -> Result<()> {
-        self.player.SetVolume(f64::from(volume))
-    }
-}
-
-impl Drop for Media {
-    fn drop(&mut self) {
-        let _ = self.player.Close();
-    }
-}
-
-fn milliseconds(span: TimeSpan) -> u64 {
-    span.Duration.max(0) as u64 / 10_000
 }
 
 #[cfg(test)]
