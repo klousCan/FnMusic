@@ -27,6 +27,9 @@ pub fn run() -> eframe::Result {
     };
     let _apartment =
         media::Apartment::new().map_err(|err| eframe::Error::AppCreation(Box::new(err)))?;
+    if let Err(err) = desktop::register_shell_identity() {
+        eprintln!("Windows 应用标识注册失败：{err}");
+    }
     let mut viewport = ViewportBuilder::default()
         .with_inner_size([1200.0, 800.0])
         .with_min_inner_size([760.0, 560.0])

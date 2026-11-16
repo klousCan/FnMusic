@@ -1,4 +1,11 @@
-use std::{path::Path, sync::mpsc, time::Duration};
+use std::{
+    ffi::OsString,
+    mem::ManuallyDrop,
+    os::windows::ffi::{OsStrExt, OsStringExt},
+    path::{Path, PathBuf},
+    sync::mpsc,
+    time::Duration,
+};
 
 use eframe::egui;
 use sha2::{Digest, Sha256};
@@ -14,22 +21,102 @@ use windows::{
         SystemMediaTransportControlsButtonPressedEventArgs,
         SystemMediaTransportControlsTimelineProperties,
     },
+    Storage::Streams::{IRandomAccessStream, RandomAccessStreamReference},
     Win32::{
-        Foundation::{CloseHandle, HANDLE, HWND, WAIT_OBJECT_0},
+        Foundation::{CloseHandle, E_OUTOFMEMORY, HANDLE, HWND, WAIT_OBJECT_0},
+        Storage::EnhancedStorage::PKEY_AppUserModel_ID,
         System::{
+            Com::{
+                CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, IPersistFile,
+                StructuredStorage::{
+                    PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
+                    PropVariantClear,
+                },
+            },
             Threading::{
                 CreateEventW, EVENT_MODIFY_STATE, OpenEventW, SetEvent, WaitForSingleObject,
             },
-            WinRT::ISystemMediaTransportControlsInterop,
+            Variant::VT_LPWSTR,
+            WinRT::{
+                BSOS_DEFAULT, CreateRandomAccessStreamOverStream,
+                ISystemMediaTransportControlsInterop,
+            },
         },
-        UI::WindowsAndMessaging::{
-            AllowSetForegroundWindow, IsIconic, IsWindowVisible, PostMessageW, WM_PAINT,
+        UI::{
+            Shell::{
+                FOLDERID_Programs, IShellLinkW, KF_FLAG_DEFAULT, PropertiesSystem::IPropertyStore,
+                SHCreateMemStream, SHGetKnownFolderPath, SHStrDupW,
+                SetCurrentProcessExplicitAppUserModelID, ShellLink,
+            },
+            WindowsAndMessaging::{
+                AllowSetForegroundWindow, IsIconic, IsWindowVisible, PostMessageW, WM_PAINT,
+            },
         },
     },
-    core::{HSTRING, Result, factory},
+    core::{HSTRING, Interface, PCWSTR, Result, factory, w},
 };
 
 use fnmusic::library::Track;
+
+const APP_ID: PCWSTR = w!("KlousCan.FnMusic");
+
+pub fn register_shell_identity() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let programs = unsafe {
+        let folder = SHGetKnownFolderPath(&FOLDERID_Programs, KF_FLAG_DEFAULT, None)?;
+        let programs = PathBuf::from(OsString::from_wide(folder.as_wide()));
+        CoTaskMemFree(Some(folder.0.cast()));
+        programs
+    };
+    save_shell_shortcut(&std::env::current_exe()?, &programs.join("飞牛音乐.lnk"))?;
+    unsafe { SetCurrentProcessExplicitAppUserModelID(APP_ID)? };
+    Ok(())
+}
+
+fn save_shell_shortcut(exe: &Path, shortcut: &Path) -> Result<()> {
+    let wide_path = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>()
+    };
+    let exe = wide_path(exe);
+    let shortcut = wide_path(shortcut);
+    unsafe {
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+        link.SetPath(PCWSTR(exe.as_ptr()))?;
+        link.SetIconLocation(PCWSTR(exe.as_ptr()), 0)?;
+        link.SetDescription(w!("飞牛音乐"))?;
+        let properties = link.cast::<IPropertyStore>()?;
+        // Match InitPropVariantFromString: a VT_LPWSTR owns a COM-allocated string.
+        let mut id = PROPVARIANT {
+            Anonymous: PROPVARIANT_0 {
+                Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
+                    vt: VT_LPWSTR,
+                    Anonymous: PROPVARIANT_0_0_0 {
+                        pwszVal: SHStrDupW(APP_ID)?,
+                    },
+                    ..Default::default()
+                }),
+            },
+        };
+        let set_id = properties.SetValue(&PKEY_AppUserModel_ID, &id);
+        let clear_id = PropVariantClear(&mut id);
+        set_id?;
+        clear_id?;
+        properties.Commit()?;
+        link.cast::<IPersistFile>()?
+            .Save(PCWSTR(shortcut.as_ptr()), true)?;
+    }
+    Ok(())
+}
+
+fn thumbnail_reference(bytes: &[u8]) -> Result<RandomAccessStreamReference> {
+    let stream = unsafe { SHCreateMemStream(Some(bytes)) }
+        .ok_or_else(|| windows::core::Error::from_hresult(E_OUTOFMEMORY))?;
+    let adapted: IRandomAccessStream =
+        unsafe { CreateRandomAccessStreamOverStream(&stream, BSOS_DEFAULT)? };
+    RandomAccessStreamReference::CreateFromStream(&adapted)
+}
 
 // A kernel event can be signalled and waited on from any thread. The Arc in Vault
 // keeps it alive until all background users have released the data-directory lock.
@@ -148,7 +235,7 @@ pub struct Desktop {
     background: CheckMenuItem,
     controls: Option<Controls>,
     receiver: mpsc::Receiver<Command>,
-    last: Option<(Option<Track>, bool, bool)>,
+    last: Option<(Option<Track>, bool, bool, bool)>,
 }
 
 impl Desktop {
@@ -281,8 +368,9 @@ impl Desktop {
         position: u64,
         duration: u64,
         background: bool,
+        thumbnail: Option<&[u8]>,
     ) {
-        let state = (track.cloned(), playing, background);
+        let state = (track.cloned(), playing, background, thumbnail.is_some());
         if self.last.as_ref() != Some(&state) {
             self.play.set_text(if playing { "暂停" } else { "播放" });
             self.play.set_enabled(track.is_some());
@@ -299,7 +387,7 @@ impl Desktop {
                 let _ = tray.set_tooltip(Some(title));
             }
             if let Some(controls) = &self.controls {
-                let _ = controls.metadata(track, playing);
+                let _ = controls.metadata(track, playing, thumbnail);
             }
             self.last = Some(state);
         }
@@ -378,7 +466,12 @@ impl Controls {
         result.controls.SetIsEnabled(false)?;
         Ok(result)
     }
-    fn metadata(&self, track: Option<&Track>, playing: bool) -> Result<()> {
+    fn metadata(
+        &self,
+        track: Option<&Track>,
+        playing: bool,
+        thumbnail: Option<&[u8]>,
+    ) -> Result<()> {
         self.controls.SetIsEnabled(track.is_some())?;
         self.controls.SetPlaybackStatus(if track.is_none() {
             MediaPlaybackStatus::Closed
@@ -395,6 +488,10 @@ impl Controls {
             music.SetTitle(&HSTRING::from(&track.title))?;
             music.SetArtist(&HSTRING::from(&track.artist))?;
             music.SetAlbumTitle(&HSTRING::from(&track.album))?;
+            let bytes = thumbnail.unwrap_or(include_bytes!("../../assets/icon.png"));
+            if let Ok(reference) = thumbnail_reference(bytes) {
+                let _ = updater.SetThumbnail(&reference);
+            }
         }
         updater.Update()
     }
@@ -428,6 +525,49 @@ impl Drop for Controls {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_shortcut_saves_app_id_and_can_be_replaced() {
+        use windows::Win32::System::Com::STGM_READ;
+        let _apartment = super::super::media::Apartment::new().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let shortcut = directory.path().join("飞牛音乐.lnk");
+        let exe = std::env::current_exe().unwrap();
+        save_shell_shortcut(&exe, &shortcut).unwrap();
+        save_shell_shortcut(&exe, &shortcut).unwrap();
+        let wide: Vec<_> = shortcut.as_os_str().encode_wide().chain(Some(0)).collect();
+        unsafe {
+            let link: IShellLinkW =
+                CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
+            link.cast::<IPersistFile>()
+                .unwrap()
+                .Load(PCWSTR(wide.as_ptr()), STGM_READ)
+                .unwrap();
+            let mut id = link
+                .cast::<IPropertyStore>()
+                .unwrap()
+                .GetValue(&PKEY_AppUserModel_ID)
+                .unwrap();
+            let value = &*id.Anonymous.Anonymous;
+            let matches =
+                value.vt == VT_LPWSTR && value.Anonymous.pwszVal.as_wide() == APP_ID.as_wide();
+            PropVariantClear(&mut id).unwrap();
+            assert!(matches);
+        }
+    }
+
+    #[test]
+    fn system_thumbnail_stream_retains_its_contents() {
+        use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
+        unsafe { RoInitialize(RO_INIT_MULTITHREADED).unwrap() };
+        let _apartment = super::super::media::Apartment;
+        let bytes = include_bytes!("../../assets/icon.png").to_vec();
+        let reference = thumbnail_reference(&bytes).unwrap();
+        let length = bytes.len() as u64;
+        drop(bytes);
+        let stream = reference.OpenReadAsync().unwrap().get().unwrap();
+        assert_eq!(stream.Size().unwrap(), length);
+    }
 
     #[test]
     fn instance_activation_is_scoped_and_consumed_once() {
@@ -480,7 +620,7 @@ mod tests {
             duration_ms: 30000,
             ..Default::default()
         };
-        desktop.sync(Some(&track), true, 1000, 30000, true);
+        desktop.sync(Some(&track), true, 1000, 30000, true, None);
         let controls = &desktop.controls.as_ref().unwrap().controls;
         assert_eq!(
             controls.PlaybackStatus().unwrap(),
@@ -552,7 +692,7 @@ mod tests {
         assert!(received.contains(&Command::Pause), "{received:?}");
         assert!(received.contains(&Command::Seek(5000)), "{received:?}");
         assert!(received.contains(&Command::Next), "{received:?}");
-        desktop.sync(None, false, 0, 0, false);
+        desktop.sync(None, false, 0, 0, false, None);
         assert!(
             !desktop
                 .controls

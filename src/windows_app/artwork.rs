@@ -2,6 +2,27 @@ use eframe::egui::{self, Color32, ColorImage, CornerRadius, Rect, TextureHandle,
 
 const THUMBNAIL: u32 = 320;
 
+pub fn system_thumbnail(image: &ColorImage) -> Vec<u8> {
+    let rgb: Vec<_> = image
+        .pixels
+        .iter()
+        .flat_map(|pixel| [pixel.r(), pixel.g(), pixel.b()])
+        .collect();
+    let mut bytes = Vec::new();
+    if image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, 80)
+        .encode(
+            &rgb,
+            image.size[0] as u32,
+            image.size[1] as u32,
+            image::ExtendedColorType::Rgb8,
+        )
+        .is_err()
+    {
+        bytes.clear();
+    }
+    bytes
+}
+
 /// Sample a small histogram instead of averaging a cover into muddy gray.
 /// Near-white/black borders and transparent pixels do not dominate the result.
 pub fn dominant_color(image: &ColorImage) -> Color32 {

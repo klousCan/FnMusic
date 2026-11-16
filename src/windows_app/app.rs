@@ -64,7 +64,7 @@ enum Event {
     LoggedOut(api::Result<()>),
     Page(u64, u32, api::Result<Listing>),
     Lyrics(u64, api::Result<String>),
-    Cover(u64, String, Option<(egui::ColorImage, Color32)>),
+    Cover(u64, String, Option<(egui::ColorImage, Color32, Vec<u8>)>),
     Favorite(u64, String, bool, api::Result<()>),
     SidebarPlaylists(u64, api::Result<Listing>),
     SidebarPlaylistCovers(u64, String, Instant, api::Result<Vec<String>>),
@@ -85,7 +85,7 @@ impl Events {
 }
 
 enum Cover {
-    Ready(TextureHandle, u64, Color32),
+    Ready(TextureHandle, u64, Color32, Vec<u8>),
     Pending,
     Missing(Instant),
 }
@@ -735,6 +735,21 @@ impl MusicApp {
             self.window_title = title;
         }
         let duration = self.duration();
+        if self.desktop.is_some()
+            && let Some(track) = self.queue.current()
+        {
+            let cover = track.cover.clone();
+            self.cover(&cover);
+        }
+        let thumbnail =
+            self.queue
+                .current()
+                .and_then(|track| match self.covers.get(&track.cover) {
+                    Some(Cover::Ready(_, _, _, bytes)) if !bytes.is_empty() => {
+                        Some(bytes.as_slice())
+                    }
+                    _ => None,
+                });
         if let Some(desktop) = &mut self.desktop {
             desktop.sync(
                 self.queue.current(),
@@ -742,6 +757,7 @@ impl MusicApp {
                 self.queue.position_ms,
                 duration,
                 self.close_to_tray,
+                thumbnail,
             );
         }
         // Also wakes a hidden idle window when another process signals activation.
@@ -1585,7 +1601,7 @@ impl MusicApp {
                     .iter()
                     .filter(|(_, cover)| !matches!(cover, Cover::Pending))
                     .min_by_key(|(_, cover)| match cover {
-                        Cover::Ready(_, used, _) => *used,
+                        Cover::Ready(_, used, ..) => *used,
                         _ => 0,
                     })
                     .map(|(key, _)| key.clone());
@@ -1602,7 +1618,8 @@ impl MusicApp {
                     Ok(data) => tokio::task::spawn_blocking(move || {
                         artwork::decode(&data).map(|image| {
                             let color = artwork::dominant_color(&image);
-                            (image, color)
+                            let thumbnail = artwork::system_thumbnail(&image);
+                            (image, color, thumbnail)
                         })
                     })
                     .await
@@ -1615,7 +1632,7 @@ impl MusicApp {
             });
         }
         match self.covers.get_mut(id) {
-            Some(Cover::Ready(texture, used, _)) => {
+            Some(Cover::Ready(texture, used, ..)) => {
                 *used = self.cover_clock;
                 Some(texture)
             }
@@ -1840,11 +1857,12 @@ impl MusicApp {
                     }
                 }
                 Event::Cover(epoch, id, cover) if epoch == self.session_epoch => {
-                    let cover = if let Some((image, color)) = cover {
+                    let cover = if let Some((image, color, thumbnail)) = cover {
                         Cover::Ready(
                             ctx.load_texture(&id, image, egui::TextureOptions::LINEAR),
                             self.cover_clock,
                             color,
+                            thumbnail,
                         )
                     } else {
                         Cover::Missing(Instant::now() + Duration::from_secs(30))
@@ -2392,7 +2410,7 @@ impl MusicApp {
             .current()
             .and_then(|track| self.covers.get(&track.cover))
             .and_then(|cover| match cover {
-                Cover::Ready(_, _, color) => Some(*color),
+                Cover::Ready(_, _, color, _) => Some(*color),
                 _ => None,
             })
             .unwrap_or_else(|| self.accent());
@@ -2886,7 +2904,7 @@ impl MusicApp {
 
     fn paint_cached_cover(&self, ui: &egui::Ui, rect: egui::Rect, id: &str, seed: &str) {
         let texture = match self.covers.get(id) {
-            Some(Cover::Ready(texture, _, _)) => Some(texture),
+            Some(Cover::Ready(texture, ..)) => Some(texture),
             _ => None,
         };
         if texture.is_none()
