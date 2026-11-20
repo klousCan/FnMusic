@@ -2008,13 +2008,13 @@ impl MusicApp {
                 self.media_open = false;
                 self.playing = true;
             }
-            Err(_) => self.media_failed(),
+            Err(error) => self.media_failed(&error.to_string()),
         }
     }
 
-    fn media_failed(&mut self) {
+    fn media_failed(&mut self, reason: &str) {
         self.stop_media();
-        self.notice = Some("无法播放这首歌曲，请检查网络或 Windows 音频格式支持".into());
+        self.notice = Some(format!("无法播放：{reason}"));
     }
 
     fn set_playback_quality(&mut self, quality: PlaybackQuality) {
@@ -2040,9 +2040,9 @@ impl MusicApp {
         self.playing = !self.playing;
         if self.media_open
             && let Some(media) = &self.media
-            && media.set_playing(self.playing).is_err()
+            && let Err(error) = media.set_playing(self.playing)
         {
-            self.media_failed();
+            self.media_failed(&error.to_string());
         }
     }
 
@@ -2227,9 +2227,9 @@ impl MusicApp {
                         self.seek(self.queue.position_ms);
                     }
                     if let Some(media) = &self.media
-                        && media.set_playing(self.playing).is_err()
+                        && let Err(error) = media.set_playing(self.playing)
                     {
-                        self.media_failed();
+                        self.media_failed(&error.to_string());
                     }
                 }
                 MediaEvent::Ended => {
@@ -2241,7 +2241,7 @@ impl MusicApp {
                         self.next_track(true);
                     }
                 }
-                MediaEvent::Failed => self.media_failed(),
+                MediaEvent::Failed(reason) => self.media_failed(&reason),
                 MediaEvent::SeekFailed => {
                     self.position_hold = Instant::now();
                     self.notice = Some("这首歌曲暂时无法跳转".into());

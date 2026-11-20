@@ -176,8 +176,12 @@ mod tests {
         loop {
             let event = media.event();
             assert!(
-                !matches!(event, Some(MediaEvent::Failed)),
-                "{name} playback failed"
+                !matches!(&event, Some(MediaEvent::Failed(_))),
+                "{name} playback failed: {:?}",
+                match &event {
+                    Some(MediaEvent::Failed(reason)) => Some(reason),
+                    _ => None,
+                }
             );
             if ready(event) {
                 return;

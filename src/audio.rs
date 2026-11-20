@@ -8,7 +8,7 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use reqwest::{
@@ -16,12 +16,12 @@ use reqwest::{
     blocking::{Client, Response},
     header::{CONTENT_RANGE, RANGE},
 };
-use rodio::{Decoder, OutputStreamBuilder, Sink, Source};
+use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 
 pub enum MediaEvent {
     Opened,
     Ended,
-    Failed,
+    Failed(String),
     SeekFailed,
 }
 
@@ -34,6 +34,8 @@ struct State {
     position: Arc<AtomicU64>,
     duration: AtomicU64,
     seek: AtomicU64,
+    device_failed: AtomicBool,
+    recovering: AtomicBool,
 }
 
 const NO_SEEK: u64 = u64::MAX;
@@ -87,8 +89,10 @@ impl Media {
             .name("fnmusic-audio".into())
             .spawn(move || {
                 let result = play(url, &worker, &sender);
-                if result.is_err() && !worker.stopped.load(Relaxed) {
-                    let _ = sender.send(MediaEvent::Failed);
+                if let Err(error) = result
+                    && !worker.stopped.load(Relaxed)
+                {
+                    let _ = sender.send(MediaEvent::Failed(error.to_string()));
                 }
             })?;
         Ok(Self { state, events })
@@ -126,7 +130,9 @@ impl Media {
     }
 
     pub fn buffering(&self) -> bool {
-        self.state.seek.load(Relaxed) != NO_SEEK
+        self.state.recovering.load(Relaxed)
+            || self.state.device_failed.load(Relaxed)
+            || self.state.seek.load(Relaxed) != NO_SEEK
             || self.state.sink().is_none_or(|sink| sink.empty())
     }
 
@@ -152,9 +158,40 @@ impl Drop for Media {
     }
 }
 
+fn open_output(state: &Arc<State>) -> io::Result<OutputStream> {
+    let callback_state = state.clone();
+    OutputStreamBuilder::from_default_device()
+        .map_err(|error| io::Error::other(format!("获取音频设备失败：{error}")))?
+        .with_error_callback(move |_| {
+            callback_state.device_failed.store(true, Relaxed);
+        })
+        .open_stream_or_fallback()
+        .map_err(|error| io::Error::other(format!("打开音频设备失败：{error}")))
+}
+
+fn recover_output(state: &Arc<State>) -> io::Result<OutputStream> {
+    let mut last_error = None;
+    // Allow USB/Bluetooth devices and Windows' default endpoint to settle.
+    for _ in 0..30 {
+        if state.stopped.load(Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "播放已停止"));
+        }
+        match open_output(state) {
+            Ok(output) => return Ok(output),
+            Err(error) => last_error = Some(error),
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(io::Error::other(format!(
+        "音频设备重连失败，请检查系统默认输出设备：{}",
+        last_error.unwrap()
+    )))
+}
+
 fn play(url: url::Url, state: &Arc<State>, events: &Sender<MediaEvent>) -> io::Result<()> {
     let failed = Arc::new(AtomicBool::new(false));
-    let input = HttpAudio::open(url, failed.clone())?;
+    let input = HttpAudio::open(url, failed.clone())
+        .map_err(|error| io::Error::other(format!("读取音频失败：{error}")))?;
     let length = input.length;
     let seekable = input.sequential.is_none();
     let mut builder = Decoder::builder().with_data(BufReader::with_capacity(64 * 1024, input));
@@ -162,23 +199,49 @@ fn play(url: url::Url, state: &Arc<State>, events: &Sender<MediaEvent>) -> io::R
         builder = builder.with_byte_len(length);
     }
     builder = builder.with_seekable(seekable);
-    let mut decoder = builder.build().map_err(io::Error::other)?;
+    let mut decoder = builder
+        .build()
+        .map_err(|error| io::Error::other(format!("音频解码失败：{error}")))?;
     if let Some(duration) = decoder.total_duration() {
         state.duration.store(duration.as_millis() as u64, Relaxed);
     }
-    let errors = events.clone();
-    let output = OutputStreamBuilder::from_default_device()
-        .map_err(io::Error::other)?
-        .with_error_callback(move |_| {
-            let _ = errors.send(MediaEvent::Failed);
-        })
-        .open_stream()
-        .map_err(io::Error::other)?;
+    let mut output = open_output(state)?;
     let mut sink = state.make_sink(output.mixer());
     let _ = events.send(MediaEvent::Opened);
     let mut next_us = 0;
     let mut eof = false;
+    let mut recoveries = 0;
+    let mut last_recovery = Instant::now();
     while !state.stopped.load(Relaxed) {
+        if state.device_failed.swap(false, Relaxed) {
+            if last_recovery.elapsed() >= Duration::from_secs(5) {
+                recoveries = 0;
+            }
+            if recoveries >= 3 {
+                return Err(io::Error::other(
+                    "音频输出设备持续失效，请在 Windows 声音设置中重新选择输出设备后重试",
+                ));
+            }
+            recoveries += 1;
+            last_recovery = Instant::now();
+            state.recovering.store(true, Relaxed);
+            sink.stop();
+            // Dispose of the invalid endpoint before opening the current default.
+            drop(output);
+            let resume_us = state.position.load(Relaxed);
+            state.device_failed.store(false, Relaxed);
+            output = recover_output(state)?;
+            if state.stopped.load(Relaxed) {
+                return Ok(());
+            }
+            if seekable && decoder.try_seek(Duration::from_micros(resume_us)).is_ok() {
+                next_us = resume_us;
+                eof = false;
+            }
+            state.position.store(next_us, Relaxed);
+            sink = state.make_sink(output.mixer());
+            state.recovering.store(false, Relaxed);
+        }
         let request = state.seek.load(Relaxed);
         if request != NO_SEEK {
             match seekable.then(|| decoder.try_seek(Duration::from_millis(request))) {
@@ -317,6 +380,27 @@ impl HttpAudio {
     }
 
     fn load_page(&mut self, start: u64) -> io::Result<()> {
+        let mut result = self.fetch_page(start);
+        for delay in [200, 600] {
+            if !result.as_ref().is_err_and(|error| {
+                matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                )
+            }) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(delay));
+            result = self.fetch_page(start);
+        }
+        result
+    }
+
+    fn fetch_page(&mut self, start: u64) -> io::Result<()> {
         let response = self
             .client
             .get(self.url.clone())
@@ -325,17 +409,42 @@ impl HttpAudio {
                 format!("bytes={start}-{}", start.saturating_add(PAGE - 1)),
             )
             .send()
-            .map_err(io::Error::other)?;
+            .map_err(|error| {
+                let kind = if error.is_timeout() {
+                    io::ErrorKind::TimedOut
+                } else {
+                    io::ErrorKind::ConnectionReset
+                };
+                let error = error.without_url();
+                let mut message = format!("连接音频服务失败：{error}");
+                let mut cause = std::error::Error::source(&error);
+                while let Some(error) = cause {
+                    message.push_str(&format!("；{error}"));
+                    cause = error.source();
+                }
+                io::Error::new(kind, message)
+            })?;
         if start == 0 && self.length.is_none() && response.status() == StatusCode::OK {
             self.length = response.content_length();
             self.sequential = Some(response);
             return Ok(());
         }
         if response.status() != StatusCode::PARTIAL_CONTENT {
-            return Err(io::Error::other(format!(
-                "audio range returned HTTP {}",
-                response.status()
-            )));
+            let status = response.status();
+            let reason = match status {
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "音频访问未授权，请重新登录",
+                StatusCode::NOT_FOUND => "歌曲文件不存在或播放地址已失效",
+                StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT => "NAS 音频服务暂时不可用",
+                _ => "音频请求失败",
+            };
+            return Err(io::Error::new(
+                if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+                    io::ErrorKind::Interrupted
+                } else {
+                    io::ErrorKind::Other
+                },
+                format!("{reason}（HTTP {status}）"),
+            ));
         }
         let range = response
             .headers()
@@ -431,9 +540,108 @@ impl Seek for HttpAudio {
 mod tests {
     use super::*;
     use axum::{Router, extract::State, http::HeaderMap, response::IntoResponse, routing::get};
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn transient_audio_failure_retries_but_unauthorized_does_not() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        for status in [StatusCode::BAD_GATEWAY, StatusCode::UNAUTHORIZED] {
+            let requests = Arc::new(AtomicUsize::new(0));
+            let count = requests.clone();
+            let address = runtime.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let app = Router::new().route(
+                    "/track.wav",
+                    get(move || {
+                        let count = count.clone();
+                        async move {
+                            if count.fetch_add(1, Relaxed) == 0 {
+                                status.into_response()
+                            } else {
+                                (
+                                    StatusCode::PARTIAL_CONTENT,
+                                    [(CONTENT_RANGE, "bytes 0-3/4")],
+                                    b"RIFF".to_vec(),
+                                )
+                                    .into_response()
+                            }
+                        }
+                    }),
+                );
+                tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                format!("http://{address}/track.wav").parse().unwrap()
+            });
+            let result = HttpAudio::open(address, Arc::new(AtomicBool::new(false)));
+            if status == StatusCode::BAD_GATEWAY {
+                let mut input = result.unwrap();
+                let mut bytes = Vec::new();
+                input.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes, b"RIFF");
+                assert_eq!(requests.load(Relaxed), 2);
+            } else {
+                let error = result.err().expect("unauthorized request must fail");
+                assert!(error.to_string().contains("401"));
+                assert_eq!(requests.load(Relaxed), 1);
+            }
+        }
+    }
 
     #[test]
     fn ranged_wav_decodes_and_seeks_without_an_audio_device() {
+        let (_runtime, addressed) = wav_server();
+        let input = HttpAudio::open(addressed, Arc::new(AtomicBool::new(false))).unwrap();
+        let length = input.length.unwrap();
+        let mut decoder = Decoder::builder()
+            .with_data(BufReader::new(input))
+            .with_byte_len(length)
+            .with_seekable(true)
+            .build()
+            .unwrap();
+        assert_eq!(decoder.next(), Some(0.25));
+        decoder.try_seek(Duration::from_secs(7)).unwrap();
+        assert_eq!(decoder.next(), Some(-0.25));
+        decoder.try_seek(Duration::from_secs(2)).unwrap();
+        assert_eq!(decoder.next(), Some(0.25));
+    }
+
+    #[test]
+    #[ignore = "requires an available native audio output device"]
+    fn output_device_failure_recovers_at_playback_position() {
+        let (_runtime, address) = wav_server();
+        let media = Media::open(address.as_str(), 0.0).unwrap();
+        media.set_playing(true).unwrap();
+        let wait = |ready: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !ready() {
+                if let Some(MediaEvent::Failed(reason)) = media.event() {
+                    panic!("playback failed: {reason}");
+                }
+                assert!(Instant::now() < deadline, "playback timed out");
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        wait(&|| media.position().is_some_and(|position| position >= 200));
+        media.seek(2_000).unwrap();
+        wait(&|| media.position().is_some_and(|position| position >= 2_000));
+        let old_sink = media.state.sink().unwrap();
+        media.state.device_failed.store(true, Relaxed);
+        wait(&|| {
+            media
+                .state
+                .sink()
+                .is_some_and(|sink| !Arc::ptr_eq(&old_sink, &sink))
+                && !media.buffering()
+                && media
+                    .position()
+                    .is_some_and(|position| position >= 2_200 && position < 4_000)
+        });
+        assert_eq!(media.state.seek.load(Relaxed), NO_SEEK);
+        assert!(media.state.playing.load(Relaxed));
+        assert_eq!(media.state.volume.load(Relaxed), 0.0_f32.to_bits());
+    }
+
+    fn wav_server() -> (tokio::runtime::Runtime, url::Url) {
         const RATE: usize = 48_000;
         const FRAMES: usize = RATE * 9;
         let pcm_len = (FRAMES * 2) as u32;
@@ -489,18 +697,6 @@ mod tests {
             });
             format!("http://{address}/track.wav").parse().unwrap()
         });
-        let input = HttpAudio::open(addressed, Arc::new(AtomicBool::new(false))).unwrap();
-        let length = input.length.unwrap();
-        let mut decoder = Decoder::builder()
-            .with_data(BufReader::new(input))
-            .with_byte_len(length)
-            .with_seekable(true)
-            .build()
-            .unwrap();
-        assert_eq!(decoder.next(), Some(0.25));
-        decoder.try_seek(Duration::from_secs(7)).unwrap();
-        assert_eq!(decoder.next(), Some(-0.25));
-        decoder.try_seek(Duration::from_secs(2)).unwrap();
-        assert_eq!(decoder.next(), Some(0.25));
+        (runtime, addressed)
     }
 }
