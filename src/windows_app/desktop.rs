@@ -23,7 +23,11 @@ use windows::{
     },
     Storage::Streams::{IRandomAccessStream, RandomAccessStreamReference},
     Win32::{
-        Foundation::{CloseHandle, E_OUTOFMEMORY, HANDLE, HWND, WAIT_OBJECT_0},
+        Foundation::{CloseHandle, E_OUTOFMEMORY, HANDLE, HWND, RECT, WAIT_OBJECT_0},
+        Graphics::{
+            Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute},
+            Gdi::{CreateRoundRectRgn, DeleteObject, HGDIOBJ, SetWindowRgn},
+        },
         Storage::EnhancedStorage::PKEY_AppUserModel_ID,
         System::{
             Com::{
@@ -43,13 +47,15 @@ use windows::{
             },
         },
         UI::{
+            HiDpi::GetDpiForWindow,
             Shell::{
                 FOLDERID_Programs, IShellLinkW, KF_FLAG_DEFAULT, PropertiesSystem::IPropertyStore,
                 SHCreateMemStream, SHGetKnownFolderPath, SHStrDupW,
                 SetCurrentProcessExplicitAppUserModelID, ShellLink,
             },
             WindowsAndMessaging::{
-                AllowSetForegroundWindow, IsIconic, IsWindowVisible, PostMessageW, WM_PAINT,
+                AllowSetForegroundWindow, GetWindowRect, IsIconic, IsWindowVisible, IsZoomed,
+                PostMessageW, WM_PAINT,
             },
         },
     },
@@ -226,7 +232,72 @@ impl Drop for BackgroundWake {
     }
 }
 
+struct WindowCorners {
+    hwnd: HWND,
+    native: bool,
+    last: Option<(i32, i32, u32, bool)>,
+}
+
+impl WindowCorners {
+    fn new(hwnd: HWND) -> Self {
+        let preference = DWMWCP_ROUND;
+        let native = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                std::ptr::from_ref(&preference).cast(),
+                std::mem::size_of_val(&preference) as u32,
+            )
+            .is_ok()
+        };
+        let mut corners = Self {
+            hwnd,
+            native,
+            last: None,
+        };
+        corners.sync();
+        corners
+    }
+
+    fn sync(&mut self) {
+        if self.native || unsafe { IsIconic(self.hwnd).as_bool() } {
+            return;
+        }
+        unsafe {
+            let mut rect = RECT::default();
+            if GetWindowRect(self.hwnd, &mut rect).is_err() {
+                return;
+            }
+            let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+            let dpi = GetDpiForWindow(self.hwnd).max(96);
+            let maximized = IsZoomed(self.hwnd).as_bool();
+            let state = (width, height, dpi, maximized);
+            if self.last == Some(state) || width <= 0 || height <= 0 {
+                return;
+            }
+            if maximized {
+                if SetWindowRgn(self.hwnd, None, true) != 0 {
+                    self.last = Some(state);
+                }
+                return;
+            }
+            let diameter = (28 * dpi / 96) as i32;
+            let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter);
+            if region.0.is_null() {
+                return;
+            }
+            // Windows owns the region after a successful SetWindowRgn call.
+            if SetWindowRgn(self.hwnd, Some(region), true) != 0 {
+                self.last = Some(state);
+            } else {
+                let _ = DeleteObject(HGDIOBJ(region.0));
+            }
+        }
+    }
+}
+
 pub struct Desktop {
+    corners: WindowCorners,
     wake: Option<BackgroundWake>,
     tray: Option<TrayIcon>,
     play: MenuItem,
@@ -341,6 +412,7 @@ impl Desktop {
         };
         (
             Self {
+                corners: WindowCorners::new(hwnd),
                 wake: background_wake,
                 tray,
                 play,
@@ -370,6 +442,7 @@ impl Desktop {
         background: bool,
         thumbnail: Option<&[u8]>,
     ) {
+        self.corners.sync();
         let state = (track.cloned(), playing, background, thumbnail.is_some());
         if self.last.as_ref() != Some(&state) {
             self.play.set_text(if playing { "暂停" } else { "播放" });

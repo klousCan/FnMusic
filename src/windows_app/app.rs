@@ -25,6 +25,7 @@ use super::{
     experience::{LyricFollow, SleepTimer},
     icons::{self, Icon},
     media::{Media, MediaEvent},
+    notifications::{Action as TipAction, Notifications},
     oauth::{Broker, Hooks},
     track_table::{Column, Table},
     updater,
@@ -224,6 +225,7 @@ pub struct MusicApp {
     loading: bool,
     page_error: Option<String>,
     notice: Option<String>,
+    notifications: Notifications,
     search: String,
     search_due: Option<Instant>,
     search_focus: bool,
@@ -267,7 +269,12 @@ impl MusicApp {
         let (desktop, errors) = Desktop::new(hwnd, self.events.ctx.clone(), self.close_to_tray);
         self.desktop = Some(desktop);
         if !errors.is_empty() {
-            self.notice = Some(errors.join("；"));
+            self.notifications.error(
+                "系统集成暂时不可用",
+                "部分托盘或媒体控制功能未能启动。",
+                errors.join("；"),
+                None,
+            );
         }
     }
 
@@ -275,7 +282,12 @@ impl MusicApp {
         self.preferences.close_to_tray = enabled;
         match self.vault.save_preferences(&self.preferences) {
             Ok(()) => self.close_to_tray = enabled,
-            Err(_) => self.notice = Some("关闭窗口的设置保存失败".into()),
+            Err(_) => self.notifications.error(
+                "设置保存失败",
+                "关闭窗口的设置未能保存。",
+                "关闭窗口的设置保存失败",
+                None,
+            ),
         }
     }
 
@@ -311,6 +323,7 @@ impl MusicApp {
         visuals.widgets.active.bg_fill = accent.gamma_multiply(0.84);
         visuals.widgets.hovered.bg_stroke.color = accent.gamma_multiply(0.65);
         visuals.menu_corner_radius = CornerRadius::same(12);
+        visuals.window_corner_radius = CornerRadius::same(16);
         super::motion::set_theme(ctx, visuals);
         ctx.style_mut(|style| {
             style
@@ -347,7 +360,12 @@ impl MusicApp {
 
     fn save_appearance(&mut self, ctx: &egui::Context) {
         if self.vault.save_preferences(&self.preferences).is_err() {
-            self.notice = Some("外观设置保存失败".into());
+            self.notifications.error(
+                "外观设置保存失败",
+                "请检查本地存储是否可写。",
+                "外观设置保存失败",
+                None,
+            );
         }
         self.close_to_tray = self.preferences.close_to_tray;
         self.apply_appearance(ctx);
@@ -677,7 +695,12 @@ impl MusicApp {
                 {
                     self.preferences.auto_check_updates = !self.preferences.auto_check_updates;
                     if self.vault.save_preferences(&self.preferences).is_err() {
-                        self.update.message = Some("更新偏好保存失败".into());
+                        self.notifications.error(
+                            "更新设置保存失败",
+                            "请检查本地存储是否可写。",
+                            "更新偏好保存失败",
+                            None,
+                        );
                     }
                     if self.preferences.auto_check_updates {
                         self.update.automatic_due = Some(Instant::now() + Duration::from_secs(2));
@@ -1063,6 +1086,7 @@ impl MusicApp {
             loading: false,
             page_error: None,
             notice: None,
+            notifications: Notifications::default(),
             search: String::new(),
             search_due: None,
             search_focus: false,
@@ -1102,8 +1126,12 @@ impl MusicApp {
         };
         app.apply_appearance(&app.events.ctx);
         if let Some(message) = updater::take_error(&app.vault.updates()) {
-            app.update.message = Some(message);
-            app.update.open = true;
+            app.notifications.error(
+                "更新未能完成",
+                "可打开更新页面重新尝试。",
+                message,
+                Some(TipAction::OpenUpdates),
+            );
             app.update.automatic_due = None;
         }
         let updates = app.vault.updates();
@@ -1120,7 +1148,12 @@ impl MusicApp {
                 app.connect(true);
             }
             Ok(None) => {}
-            Err(_) => app.notice = Some("无法读取已保存的会话，请重新授权".into()),
+            Err(error) => app.notifications.error(
+                "无法恢复登录",
+                "请重新登录以连接 NAS。",
+                error.to_string(),
+                Some(TipAction::Login),
+            ),
         }
         Ok(app)
     }
@@ -1233,6 +1266,7 @@ impl MusicApp {
     }
 
     fn disconnect(&mut self, explicit: bool) {
+        self.notifications.clear();
         self.persist();
         self.daily_cache = None;
         self.daily_path = None;
@@ -1292,7 +1326,12 @@ impl MusicApp {
                 events.send(Event::LoggedOut(local.and(clear)));
             });
         } else {
-            self.notice = Some(Error::Expired.to_string());
+            self.notifications.error(
+                "登录已过期",
+                "请重新登录以继续使用音乐资料库。",
+                Error::Expired.to_string(),
+                Some(TipAction::Login),
+            );
         }
     }
 
@@ -1706,7 +1745,12 @@ impl MusicApp {
                             self.update.message = None;
                         }
                         Ok(None) => self.update.message = Some("当前已是最新正式版本".into()),
-                        Err(error) => self.update.message = Some(error),
+                        Err(error) => self.notifications.error(
+                            "检查更新失败",
+                            "请检查网络，稍后可以再次检查。",
+                            error,
+                            Some(TipAction::CheckUpdates),
+                        ),
                     }
                 }
                 Event::UpdateProgress(epoch, received, total) if epoch == self.update.epoch => {
@@ -1728,8 +1772,12 @@ impl MusicApp {
                         }
                         Err(error) => {
                             self.update.phase = UpdatePhase::Idle;
-                            self.update.message = Some(error);
-                            self.update.open = true;
+                            self.notifications.error(
+                                "更新下载失败",
+                                "请检查网络后重新下载。",
+                                error,
+                                Some(TipAction::DownloadUpdate),
+                            );
                         }
                     }
                 }
@@ -1744,8 +1792,12 @@ impl MusicApp {
                         }
                         Err(error) => {
                             self.update.phase = UpdatePhase::Idle;
-                            self.update.message = Some(error);
-                            self.update.open = true;
+                            self.notifications.error(
+                                "更新未能安装",
+                                "可打开更新页面重新尝试。",
+                                error,
+                                Some(TipAction::OpenUpdates),
+                            );
                         }
                     }
                 }
@@ -1753,6 +1805,7 @@ impl MusicApp {
                     self.auth_busy = false;
                     match result {
                         Ok(connection) => {
+                            self.notifications.clear();
                             let Connection {
                                 credentials,
                                 session,
@@ -1783,19 +1836,29 @@ impl MusicApp {
                             self.request_daily();
                             self.request_lyrics();
                         }
-                        Err(error) => self.notice = Some(error.to_string()),
+                        Err(error) => self.notifications.error(
+                            "连接 NAS 失败",
+                            "请检查地址和网络后重新登录。",
+                            error.to_string(),
+                            Some(TipAction::Login),
+                        ),
                     }
                 }
                 Event::LoggedOut(result) => {
                     self.auth_busy = false;
                     self.logging_out = false;
-                    self.notice = Some(match result {
+                    match result {
                         Ok(()) => {
                             self.saved = None;
-                            "已退出登录".into()
+                            self.notice = Some("已退出登录".into());
                         }
-                        Err(error) => error.to_string(),
-                    });
+                        Err(error) => self.notifications.error(
+                            "退出登录未能完成",
+                            "本地会话或授权窗口的数据未能清除。",
+                            error.to_string(),
+                            None,
+                        ),
+                    }
                     if self.close_after_logout {
                         self.exiting = true;
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1814,13 +1877,26 @@ impl MusicApp {
                             }
                             if let Some(path) = &self.daily_path {
                                 if daily::save(path, &cache).is_err() {
-                                    self.notice = Some("今日推荐已生成，但无法保存本地缓存".into());
+                                    self.notifications.error(
+                                        "推荐缓存保存失败",
+                                        "今日推荐可继续使用，缓存未能保存。",
+                                        "今日推荐已生成，但无法保存本地缓存",
+                                        None,
+                                    );
                                 }
                             }
                             self.daily_error = None;
                             self.daily_cache = Some(cache);
                         }
-                        Err(err) => self.daily_error = Some(err.to_string()),
+                        Err(err) => {
+                            self.daily_error = Some(err.to_string());
+                            self.notifications.error(
+                                "每日推荐加载失败",
+                                "请检查 NAS 连接后重试。",
+                                err.to_string(),
+                                Some(TipAction::Page(Page::Daily, 1)),
+                            );
+                        }
                     }
                     self.show_daily_listing();
                 }
@@ -1846,14 +1922,30 @@ impl MusicApp {
                                 self.track_table.retain(&self.listing.tracks);
                             }
                         }
-                        Err(error) => self.page_error = Some(error.to_string()),
+                        Err(error) => {
+                            self.page_error = Some(error.to_string());
+                            self.notifications.error(
+                                "资料库加载失败",
+                                "本次内容未能加载，请重试。",
+                                error.to_string(),
+                                Some(TipAction::Page(self.page.clone(), number)),
+                            );
+                        }
                     }
                 }
                 Event::Lyrics(epoch, result) if epoch == self.track_epoch => {
                     self.lyrics_loading = false;
                     match result {
                         Ok(text) => self.lyrics = playback::parse_lrc(&text),
-                        Err(error) => self.lyric_error = Some(error.to_string()),
+                        Err(error) => {
+                            self.lyric_error = Some(error.to_string());
+                            self.notifications.error(
+                                "歌词加载失败",
+                                "暂时无法读取这首歌曲的歌词。",
+                                error.to_string(),
+                                Some(TipAction::Lyrics(self.track_epoch)),
+                            );
+                        }
                     }
                 }
                 Event::Cover(epoch, id, cover) if epoch == self.session_epoch => {
@@ -1914,7 +2006,12 @@ impl MusicApp {
                                 track.favorite = on;
                             }
                         }
-                        Err(error) => self.notice = Some(error.to_string()),
+                        Err(error) => self.notifications.error(
+                            "收藏操作失败",
+                            "歌曲收藏未能保存，请稍后重试。",
+                            error.to_string(),
+                            Some(TipAction::Favorite(self.session_epoch, id.clone(), on)),
+                        ),
                     }
                     if self.page == Page::Favorites && self.favorite_pending.is_empty() {
                         self.open_page(Page::Favorites, false);
@@ -1955,7 +2052,12 @@ impl MusicApp {
                             }
                             self.notice = Some(format!("已添加到「{}」", playlist.title));
                         }
-                        Err(error) => self.notice = Some(error.to_string()),
+                        Err(error) => self.notifications.error(
+                            "歌单添加失败",
+                            "歌曲未能添加到歌单，请稍后重试。",
+                            error.to_string(),
+                            None,
+                        ),
                     }
                 }
                 _ => {}
@@ -2014,7 +2116,23 @@ impl MusicApp {
 
     fn media_failed(&mut self, reason: &str) {
         self.stop_media();
-        self.notice = Some(format!("无法播放：{reason}"));
+        let device = reason.contains("设备");
+        self.notifications.error(
+            if device {
+                "音频设备暂时不可用"
+            } else {
+                "歌曲播放失败"
+            },
+            if device {
+                "请检查耳机或系统默认输出设备。"
+            } else {
+                "暂时无法读取或播放这首歌曲，请重试。"
+            },
+            reason,
+            self.queue
+                .current()
+                .map(|track| TipAction::Playback(track.id.clone())),
+        );
     }
 
     fn set_playback_quality(&mut self, quality: PlaybackQuality) {
@@ -2200,7 +2318,12 @@ impl MusicApp {
             && let Some(media) = &self.media
         {
             if media.seek(position).is_err() {
-                self.notice = Some("这首歌曲暂时无法跳转".into());
+                self.notifications.error(
+                    "暂时无法跳转",
+                    "可以继续播放这首歌曲。",
+                    "这首歌曲暂时无法跳转",
+                    None,
+                );
             }
             self.position_hold = Instant::now() + Duration::from_millis(450);
         }
@@ -2244,7 +2367,12 @@ impl MusicApp {
                 MediaEvent::Failed(reason) => self.media_failed(&reason),
                 MediaEvent::SeekFailed => {
                     self.position_hold = Instant::now();
-                    self.notice = Some("这首歌曲暂时无法跳转".into());
+                    self.notifications.error(
+                        "暂时无法跳转",
+                        "可以继续播放这首歌曲。",
+                        "这首歌曲暂时无法跳转",
+                        None,
+                    );
                 }
             }
         }
@@ -2266,7 +2394,12 @@ impl MusicApp {
             if vault::save_queue(path, &self.queue).is_ok() {
                 self.dirty = false;
             } else {
-                self.notice = Some(Error::Storage.to_string());
+                self.notifications.error(
+                    "播放记录保存失败",
+                    "当前播放列表未能保存到本地。",
+                    Error::Storage.to_string(),
+                    None,
+                );
             }
         }
     }
@@ -2377,10 +2510,6 @@ impl MusicApp {
                     ui.add_space(12.0);
                     ui.spinner();
                     ui.label("正在解析连接或等待 NAS 授权…");
-                }
-                if let Some(notice) = &self.notice {
-                    ui.add_space(14.0);
-                    ui.label(RichText::new(notice).color(ACCENT));
                 }
             });
         });
@@ -2748,14 +2877,6 @@ impl MusicApp {
                     if let Some(subtitle) = subtitle.filter(|text| !text.is_empty()) {
                         ui.label(RichText::new(subtitle).weak());
                     }
-                    if let Some(message) = self.notice.clone() {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new(message).color(ACCENT));
-                            if ui.small_button("关闭").clicked() {
-                                self.notice = None;
-                            }
-                        });
-                    }
                     ui.add_space(9.0);
 
                     if self.page == Page::Home {
@@ -2820,9 +2941,9 @@ impl MusicApp {
                         ui.add_space(12.0);
                         ui.label(RichText::new("正在读取资料库…").small().weak());
                         self.loading_skeleton(ui);
-                    } else if let Some(error) = &self.page_error {
+                    } else if self.page_error.is_some() {
                         ui.add_space(12.0);
-                        ui.label(RichText::new(error).color(ACCENT));
+                        ui.label(RichText::new("内容暂未加载").weak());
                         load_more = ui.button("重试").clicked();
                     } else if self.listing.has_more {
                         ui.add_space(12.0);
@@ -4285,8 +4406,8 @@ impl MusicApp {
     fn lyrics_view(&mut self, ui: &mut egui::Ui) {
         if self.lyrics_loading {
             lyric_skeleton(ui);
-        } else if let Some(error) = &self.lyric_error {
-            ui.label(RichText::new(error).weak());
+        } else if self.lyric_error.is_some() {
+            ui.label(RichText::new("歌词暂未加载").weak());
             if ui.button("重试").clicked() {
                 self.request_lyrics();
             }
@@ -4373,6 +4494,7 @@ impl eframe::App for MusicApp {
         }
         if self.session.is_none() {
             self.login_view(ctx);
+            self.show_notifications(ctx);
             return;
         }
         if self
@@ -4391,6 +4513,7 @@ impl eframe::App for MusicApp {
             self.toggle_playing();
         }
         self.render_library_shell(ctx);
+        self.show_notifications(ctx);
         if self.playing || self.media.is_some() || self.dirty {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
@@ -4398,6 +4521,63 @@ impl eframe::App for MusicApp {
 }
 
 impl MusicApp {
+    fn show_notifications(&mut self, ctx: &egui::Context) {
+        if let Some(message) = self.notice.take() {
+            self.notifications.info(message);
+        }
+        for action in self.notifications.show(ctx, TITLE_BAR_HEIGHT + 14.0) {
+            match action {
+                TipAction::Playback(id) => {
+                    if self.session.is_some()
+                        && self.queue.current().is_some_and(|track| track.id == id)
+                    {
+                        self.stop_media();
+                        self.open_media();
+                    }
+                }
+                TipAction::Login => {
+                    if self.session.is_none() && !self.logging_out {
+                        self.connect(false);
+                    }
+                }
+                TipAction::Page(page, number) => {
+                    if self.session.is_some() && !self.loading {
+                        if self.page == page {
+                            let number = if number == self.page_number + 1 {
+                                number
+                            } else {
+                                1
+                            };
+                            self.load_page(number);
+                        } else {
+                            self.open_page(page, true);
+                        }
+                    }
+                }
+                TipAction::Lyrics(epoch) => {
+                    if epoch == self.track_epoch && !self.lyrics_loading {
+                        self.request_lyrics();
+                    }
+                }
+                TipAction::Favorite(epoch, id, on) => {
+                    if epoch == self.session_epoch {
+                        self.set_tracks_favorite(
+                            &[Track {
+                                id,
+                                favorite: !on,
+                                ..Default::default()
+                            }],
+                            on,
+                        );
+                    }
+                }
+                TipAction::CheckUpdates => self.check_updates(true),
+                TipAction::DownloadUpdate => self.download_update(),
+                TipAction::OpenUpdates => self.update.open = true,
+            }
+        }
+    }
+
     fn title_bar(&mut self, ctx: &egui::Context) {
         let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
         let library = self.session.is_some() && !self.lyrics_detail;
@@ -4429,6 +4609,32 @@ impl MusicApp {
                     |ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         ui.add_space(16.0);
+                        let (brand, brand_response) = ui.allocate_exact_size(
+                            egui::vec2(110.0, TITLE_BAR_HEIGHT),
+                            egui::Sense::click_and_drag(),
+                        );
+                        let logo = egui::Rect::from_center_size(
+                            brand.left_center() + egui::vec2(12.0, 0.0),
+                            egui::vec2(24.0, 24.0),
+                        )
+                        .round_to_pixels(ctx.pixels_per_point());
+                        icons::app_logo(ui, logo);
+                        paint_track_text(
+                            ui,
+                            brand.left() + 34.0,
+                            brand.center().y,
+                            72.0,
+                            "飞牛音乐",
+                            ui.visuals().text_color(),
+                            14.0,
+                        );
+                        if brand_response.drag_started() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        }
+                        if brand_response.double_clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                        }
+                        ui.add_space(8.0);
                         if library {
                             let sidebar_label = if self.sidebar_collapsed {
                                 "显示侧边栏（Ctrl+B）"
@@ -4510,8 +4716,6 @@ impl MusicApp {
                             } else {
                                 String::new()
                             }
-                        } else if self.session.is_none() {
-                            "飞牛音乐".to_owned()
                         } else {
                             String::new()
                         };

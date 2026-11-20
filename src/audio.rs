@@ -1,7 +1,7 @@
 //! Playback backend shared by desktop platforms. Only decoded samples reach
 //! the audio callback. HTTP and decoding run on the playback worker.
 use std::{
-    io::{self, BufReader, Read, Seek, SeekFrom},
+    io::{self, BufReader, Read, Seek, SeekFrom, Write},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed},
@@ -41,6 +41,7 @@ struct State {
 const NO_SEEK: u64 = u64::MAX;
 const PAGE: u64 = 512 * 1024;
 const BUFFER_TARGET_US: u64 = 1_000_000;
+type ReadFailure = Arc<Mutex<Option<String>>>;
 
 impl State {
     fn sink(&self) -> Option<Arc<Sink>> {
@@ -189,11 +190,12 @@ fn recover_output(state: &Arc<State>) -> io::Result<OutputStream> {
 }
 
 fn play(url: url::Url, state: &Arc<State>, events: &Sender<MediaEvent>) -> io::Result<()> {
-    let failed = Arc::new(AtomicBool::new(false));
+    let failed = ReadFailure::default();
     let input = HttpAudio::open(url, failed.clone())
         .map_err(|error| io::Error::other(format!("读取音频失败：{error}")))?;
     let length = input.length;
-    let seekable = input.sequential.is_none();
+    // The progressive disk cache makes seeking independent of HTTP range support.
+    let seekable = true;
     let mut builder = Decoder::builder().with_data(BufReader::with_capacity(64 * 1024, input));
     if let Some(length) = length {
         builder = builder.with_byte_len(length);
@@ -279,8 +281,12 @@ fn play(url: url::Url, state: &Arc<State>, events: &Sender<MediaEvent>) -> io::R
                 .filter(|n| *n > 0)
                 .unwrap_or(count);
             let samples: Vec<_> = decoder.by_ref().take(count.min(span)).collect();
-            if failed.load(Relaxed) {
-                return Err(io::Error::other("NAS audio stream interrupted"));
+            if let Some(reason) = failed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+            {
+                return Err(io::Error::other(format!("读取 NAS 音频中断：{reason}")));
             }
             if samples.is_empty() {
                 eof = true;
@@ -350,14 +356,17 @@ struct HttpAudio {
     url: url::Url,
     length: Option<u64>,
     position: u64,
+    cursor: u64,
+    cache: std::fs::File,
     page_start: u64,
     bytes: Vec<u8>,
     sequential: Option<Response>,
-    failed: Arc<AtomicBool>,
+    sequential_end: Option<u64>,
+    failed: ReadFailure,
 }
 
 impl HttpAudio {
-    fn open(url: url::Url, failed: Arc<AtomicBool>) -> io::Result<Self> {
+    fn open(url: url::Url, failed: ReadFailure) -> io::Result<Self> {
         let client = Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -370,9 +379,12 @@ impl HttpAudio {
             url,
             length: None,
             position: 0,
+            cursor: 0,
+            cache: tempfile::tempfile()?,
             page_start: 0,
             bytes: Vec::new(),
             sequential: None,
+            sequential_end: None,
             failed,
         };
         input.load_page(0)?;
@@ -404,10 +416,7 @@ impl HttpAudio {
         let response = self
             .client
             .get(self.url.clone())
-            .header(
-                RANGE,
-                format!("bytes={start}-{}", start.saturating_add(PAGE - 1)),
-            )
+            .header(RANGE, format!("bytes={start}-"))
             .send()
             .map_err(|error| {
                 let kind = if error.is_timeout() {
@@ -424,8 +433,28 @@ impl HttpAudio {
                 }
                 io::Error::new(kind, message)
             })?;
-        if start == 0 && self.length.is_none() && response.status() == StatusCode::OK {
-            self.length = response.content_length();
+        if response.status() == StatusCode::OK {
+            let length = response.content_length();
+            if self
+                .length
+                .zip(length)
+                .is_some_and(|(known, actual)| known != actual)
+            {
+                return Err(io::Error::other("NAS 返回的音频文件长度发生变化"));
+            }
+            let mut response = response;
+            // Some NAS/proxy paths ignore Range after the initial request.
+            // A 200 response starts at byte zero, so discard exactly the consumed bytes.
+            let skipped = io::copy(&mut response.by_ref().take(start), &mut io::sink())
+                .map_err(audio_body_error)?;
+            if skipped != start {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "NAS 音频在恢复位置前提前结束",
+                ));
+            }
+            self.length = length.or(self.length);
+            self.sequential_end = self.length;
             self.sequential = Some(response);
             return Ok(());
         }
@@ -462,17 +491,42 @@ impl HttpAudio {
                 ))
             })
             .ok_or_else(|| io::Error::other("invalid audio Content-Range"))?;
-        if offset != start
+        if offset > start
             || end < start
             || end >= length
-            || end - start >= PAGE
             || self.length.is_some_and(|known| known != length)
         {
-            return Err(io::Error::other("mismatched audio Content-Range"));
+            return Err(io::Error::other(format!(
+                "音频分段不匹配：请求 bytes={start}-，返回 bytes {offset}-{end}/{length}，已知文件长度 {:?}",
+                self.length
+            )));
+        }
+        let mut response = response;
+        let prefix = start - offset;
+        if prefix > 0 {
+            let skipped = io::copy(&mut response.by_ref().take(prefix), &mut io::sink())
+                .map_err(audio_body_error)?;
+            if skipped != prefix {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "音频分段在请求位置前提前结束",
+                ));
+            }
         }
         let count = end - start + 1;
+        // NAS/proxy streams can return a wider range than the requested page.
+        // Keep that response streaming so memory remains bounded.
+        if count > PAGE {
+            self.length = Some(length);
+            self.sequential_end = Some(end + 1);
+            self.sequential = Some(response);
+            return Ok(());
+        }
         let mut bytes = Vec::with_capacity(count as usize);
-        response.take(count + 1).read_to_end(&mut bytes)?;
+        response
+            .take(count + 1)
+            .read_to_end(&mut bytes)
+            .map_err(audio_body_error)?;
         if bytes.len() as u64 != count {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -482,6 +536,8 @@ impl HttpAudio {
         self.length = Some(length);
         self.page_start = start;
         self.bytes = bytes;
+        self.sequential = None;
+        self.sequential_end = None;
         Ok(())
     }
 
@@ -489,49 +545,144 @@ impl HttpAudio {
         if out.is_empty() || self.length.is_some_and(|len| self.position >= len) {
             return Ok(0);
         }
-        let n = if let Some(response) = &mut self.sequential {
-            response.read(out)?
+        if self.sequential_end == Some(self.position) {
+            self.sequential = None;
+            self.sequential_end = None;
+        }
+        let sequential = self.sequential.is_some();
+        let mut result = self.read_chunk(out);
+        for delay in [200, 600] {
+            if !sequential
+                || !result.as_ref().is_err_and(|error| {
+                    matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    )
+                })
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(delay));
+            self.sequential = None;
+            // Resume at the last delivered byte; never replay decoded audio.
+            result = self
+                .load_page(self.position)
+                .and_then(|_| self.read_chunk(out));
+        }
+        let n = result?;
+        self.position += n as u64;
+        Ok(n)
+    }
+
+    fn read_chunk(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let n = if self.sequential.is_some() {
+            self.read_sequential(out)?
         } else {
             if self.position < self.page_start
                 || self.position - self.page_start >= self.bytes.len() as u64
             {
                 self.load_page(self.position)?;
             }
+            if self.sequential.is_some() {
+                return self.read_sequential(out);
+            }
             let start = (self.position - self.page_start) as usize;
             let n = out.len().min(self.bytes.len() - start);
             out[..n].copy_from_slice(&self.bytes[start..start + n]);
             n
         };
-        self.position += n as u64;
+        Ok(n)
+    }
+
+    fn read_sequential(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let response = self.sequential.as_mut().expect("sequential response");
+        let remaining = self
+            .sequential_end
+            .map(|end| end.saturating_sub(self.position))
+            .unwrap_or(out.len() as u64);
+        let count = out.len().min(remaining.min(usize::MAX as u64) as usize);
+        let out = &mut out[..count];
+        let n = response.read(out).map_err(audio_body_error)?;
+        if n == 0 && self.length.is_some_and(|length| self.position < length) {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "NAS 音频连接提前结束",
+            ));
+        }
+        Ok(n)
+    }
+
+    fn cache_chunk(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let start = self.position;
+        let n = self.read_audio(out)?;
+        if n > 0 {
+            self.cache.seek(SeekFrom::Start(start))?;
+            self.cache.write_all(&out[..n])?;
+        }
+        Ok(n)
+    }
+
+    fn read_cached(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        // Advance within the original response when seeking beyond cached bytes.
+        // Reopening a playlist stream can select a different encoded resource.
+        let mut buffer = [0_u8; 64 * 1024];
+        while self.position < self.cursor {
+            if self.cache_chunk(&mut buffer)? == 0 {
+                return Ok(0);
+            }
+        }
+        let n = if self.cursor < self.position {
+            self.cache.seek(SeekFrom::Start(self.cursor))?;
+            let count = out
+                .len()
+                .min((self.position - self.cursor).min(usize::MAX as u64) as usize);
+            self.cache.read(&mut out[..count])?
+        } else {
+            self.cache_chunk(out)?
+        };
+        self.cursor += n as u64;
         Ok(n)
     }
 }
 
 impl Read for HttpAudio {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        let result = self.read_audio(out);
+        let result = self.read_cached(out);
         if result.is_err() {
-            self.failed.store(true, Relaxed);
+            *self
+                .failed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) =
+                result.as_ref().err().map(ToString::to_string);
         }
         result
     }
+}
+
+fn audio_body_error(error: io::Error) -> io::Error {
+    // reqwest exposes body transfer failures as io::ErrorKind::Other.
+    // Treat them as reconnectable while retaining the original cause.
+    io::Error::new(
+        io::ErrorKind::ConnectionReset,
+        format!("音频响应读取失败：{error}"),
+    )
 }
 
 impl Seek for HttpAudio {
     fn seek(&mut self, offset: SeekFrom) -> io::Result<u64> {
         let position = match offset {
             SeekFrom::Start(value) => Some(value),
-            SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
+            SeekFrom::Current(delta) => self.cursor.checked_add_signed(delta),
             SeekFrom::End(delta) => self.length.and_then(|len| len.checked_add_signed(delta)),
         }
         .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "invalid audio seek"))?;
-        if self.sequential.is_some() && position != self.position {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "server does not support byte ranges",
-            ));
-        }
-        self.position = position;
+        self.cursor = position;
         Ok(position)
     }
 }
@@ -541,6 +692,264 @@ mod tests {
     use super::*;
     use axum::{Router, extract::State, http::HeaderMap, response::IntoResponse, routing::get};
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn playback_and_seeks_share_one_response_when_playlist_lengths_change_between_requests() {
+        use axum::{body::Body, http::header::CONTENT_LENGTH, response::Response};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let payload: Arc<Vec<u8>> = Arc::new(
+            (0..PAGE as usize * 3 + 257)
+                .map(|n| (n % 251) as u8)
+                .collect(),
+        );
+        for partial in [false, true] {
+            let requests = Arc::new(AtomicUsize::new(0));
+            let count = requests.clone();
+            let data = payload.clone();
+            let address = runtime.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let app = Router::new().route(
+                    "/playlist-track.flac",
+                    get(move |headers: HeaderMap| {
+                        let data = data.clone();
+                        let count = count.clone();
+                        async move {
+                            assert_eq!(headers[RANGE], "bytes=0-");
+                            let first = count.fetch_add(1, Relaxed) == 0;
+                            let bytes = if first {
+                                data.as_ref().clone()
+                            } else {
+                                vec![99; data.len() + 156906]
+                            };
+                            let mut response =
+                                Response::builder().header(CONTENT_LENGTH, bytes.len());
+                            if partial {
+                                response = response.status(StatusCode::PARTIAL_CONTENT).header(
+                                    CONTENT_RANGE,
+                                    format!("bytes 0-{}/{}", bytes.len() - 1, bytes.len()),
+                                );
+                            }
+                            response.body(Body::from(bytes)).unwrap()
+                        }
+                    }),
+                );
+                tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                format!("http://{address}/playlist-track.flac")
+                    .parse()
+                    .unwrap()
+            });
+            let mut input = HttpAudio::open(address, ReadFailure::default()).unwrap();
+            let mut head = [0; 123];
+            input.read_exact(&mut head).unwrap();
+            assert_eq!(head.as_slice(), &payload[..123]);
+            let position = PAGE + 123;
+            input.seek(SeekFrom::Start(position)).unwrap();
+            let mut middle = [0; 4096];
+            input.read_exact(&mut middle).unwrap();
+            assert_eq!(
+                middle.as_slice(),
+                &payload[position as usize..position as usize + 4096]
+            );
+            input.seek(SeekFrom::End(-32)).unwrap();
+            let mut tail = Vec::new();
+            input.read_to_end(&mut tail).unwrap();
+            assert_eq!(tail, payload[payload.len() - 32..]);
+            input.seek(SeekFrom::Start(0)).unwrap();
+            let mut all = Vec::new();
+            input.read_to_end(&mut all).unwrap();
+            assert_eq!(all, *payload);
+            assert_eq!(
+                requests.load(Relaxed),
+                1,
+                "a seek must not fetch a new playlist resource"
+            );
+            assert_eq!(input.length, Some(payload.len() as u64));
+        }
+    }
+
+    #[test]
+    fn wider_partial_responses_stream_without_losing_bytes_and_remain_seekable() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let payload: Arc<Vec<u8>> = Arc::new(
+            (0..PAGE as usize * 3 + 257)
+                .map(|n| (n % 251) as u8)
+                .collect(),
+        );
+        let data = payload.clone();
+        let address = runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                "/track.flac",
+                get(move |headers: HeaderMap| {
+                    let data = data.clone();
+                    async move {
+                        let requested: usize = headers[RANGE]
+                            .to_str()
+                            .unwrap()
+                            .strip_prefix("bytes=")
+                            .unwrap()
+                            .split('-')
+                            .next()
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        // Mimic a proxy returning a larger, aligned byte window.
+                        let start = requested / PAGE as usize * PAGE as usize;
+                        let end = (start + PAGE as usize * 2).min(data.len());
+                        (
+                            StatusCode::PARTIAL_CONTENT,
+                            [(
+                                CONTENT_RANGE,
+                                format!("bytes {start}-{}/{}", end - 1, data.len()),
+                            )],
+                            data[start..end].to_vec(),
+                        )
+                            .into_response()
+                    }
+                }),
+            );
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            format!("http://{address}/track.flac").parse().unwrap()
+        });
+        let mut input = HttpAudio::open(address, ReadFailure::default()).unwrap();
+        assert!(input.sequential.is_some());
+        assert!(
+            input.bytes.is_empty(),
+            "wide responses must not be buffered in full"
+        );
+        let mut actual = Vec::new();
+        input.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, *payload);
+        let offset = PAGE + 123;
+        input.seek(SeekFrom::Start(offset)).unwrap();
+        let mut part = vec![0; 999];
+        input.read_exact(&mut part).unwrap();
+        assert_eq!(part, payload[offset as usize..offset as usize + 999]);
+        input.seek(SeekFrom::Start(0)).unwrap();
+        input.read_exact(&mut part).unwrap();
+        assert_eq!(part, payload[..999]);
+    }
+
+    #[test]
+    fn mismatched_range_is_rejected_with_requested_and_returned_offsets() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let address = runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new().route(
+                "/track.flac",
+                get(|| async {
+                    (
+                        StatusCode::PARTIAL_CONTENT,
+                        [(CONTENT_RANGE, "bytes 1-3/4")],
+                        b"bad".to_vec(),
+                    )
+                }),
+            );
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            format!("http://{address}/track.flac").parse().unwrap()
+        });
+        let error = HttpAudio::open(address, ReadFailure::default())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("bytes=0-"));
+        assert!(error.to_string().contains("bytes 1-3/4"));
+    }
+
+    #[test]
+    fn audio_continues_across_ignored_ranges_and_dropped_streams() {
+        use axum::{
+            body::{Body, Bytes},
+            http::header::CONTENT_LENGTH,
+            response::Response,
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let payload: Arc<Vec<u8>> =
+            Arc::new((0..PAGE as usize + 257).map(|n| (n % 251) as u8).collect());
+        for drop_stream in [false, true] {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let history = requests.clone();
+            let data = payload.clone();
+            let address = runtime.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let app = Router::new().route(
+                    "/track.mp3",
+                    get(move |headers: HeaderMap| {
+                        let data = data.clone();
+                        let history = history.clone();
+                        async move {
+                            let range = headers[RANGE].to_str().unwrap();
+                            let start: usize = range
+                                .strip_prefix("bytes=")
+                                .unwrap()
+                                .split('-')
+                                .next()
+                                .unwrap()
+                                .parse()
+                                .unwrap();
+                            let first = {
+                                let mut history = history.lock().unwrap();
+                                history.push(start);
+                                history.len() == 1
+                            };
+                            if first && drop_stream {
+                                let part = Bytes::copy_from_slice(&data[..PAGE as usize]);
+                                let body = Body::from_stream(futures_util::stream::unfold(
+                                    Some(part),
+                                    |part| async move {
+                                        if let Some(part) = part {
+                                            Some((Ok::<_, io::Error>(part), None))
+                                        } else {
+                                            tokio::time::sleep(Duration::from_millis(30)).await;
+                                            Some((
+                                                Err(io::Error::new(
+                                                    io::ErrorKind::ConnectionReset,
+                                                    "simulated disconnect",
+                                                )),
+                                                None,
+                                            ))
+                                        }
+                                    },
+                                ));
+                                return Response::builder()
+                                    .header(CONTENT_LENGTH, data.len())
+                                    .body(body)
+                                    .unwrap();
+                            }
+                            if !first && !drop_stream {
+                                return Response::builder()
+                                    .header(CONTENT_LENGTH, data.len())
+                                    .body(Body::from(data.as_ref().clone()))
+                                    .unwrap();
+                            }
+                            let end = (start + PAGE as usize).min(data.len());
+                            Response::builder()
+                                .status(StatusCode::PARTIAL_CONTENT)
+                                .header(
+                                    CONTENT_RANGE,
+                                    format!("bytes {start}-{}/{}", end - 1, data.len()),
+                                )
+                                .body(Body::from(data[start..end].to_vec()))
+                                .unwrap()
+                        }
+                    }),
+                );
+                tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                format!("http://{address}/track.mp3").parse().unwrap()
+            });
+            let failure = ReadFailure::default();
+            let mut input = HttpAudio::open(address, failure.clone()).unwrap();
+            let mut actual = Vec::new();
+            input.read_to_end(&mut actual).unwrap();
+            assert_eq!(actual, *payload, "stream mode {drop_stream}");
+            assert_eq!(*requests.lock().unwrap(), vec![0, PAGE as usize]);
+            assert_eq!(input.position, payload.len() as u64);
+            assert!(failure.lock().unwrap().is_none());
+        }
+    }
 
     #[test]
     fn transient_audio_failure_retries_but_unauthorized_does_not() {
@@ -572,7 +981,7 @@ mod tests {
                 tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
                 format!("http://{address}/track.wav").parse().unwrap()
             });
-            let result = HttpAudio::open(address, Arc::new(AtomicBool::new(false)));
+            let result = HttpAudio::open(address, ReadFailure::default());
             if status == StatusCode::BAD_GATEWAY {
                 let mut input = result.unwrap();
                 let mut bytes = Vec::new();
@@ -590,7 +999,7 @@ mod tests {
     #[test]
     fn ranged_wav_decodes_and_seeks_without_an_audio_device() {
         let (_runtime, addressed) = wav_server();
-        let input = HttpAudio::open(addressed, Arc::new(AtomicBool::new(false))).unwrap();
+        let input = HttpAudio::open(addressed, ReadFailure::default()).unwrap();
         let length = input.length.unwrap();
         let mut decoder = Decoder::builder()
             .with_data(BufReader::new(input))
@@ -681,7 +1090,10 @@ mod tests {
                                 .unwrap();
                             let (first, last) = range.split_once('-').unwrap();
                             let first: usize = first.parse().unwrap();
-                            let last = last.parse::<usize>().unwrap().min(wav.len() - 1);
+                            let last = last
+                                .parse::<usize>()
+                                .unwrap_or(wav.len() - 1)
+                                .min(wav.len() - 1);
                             (
                                 StatusCode::PARTIAL_CONTENT,
                                 [(CONTENT_RANGE, format!("bytes {first}-{last}/{}", wav.len()))],

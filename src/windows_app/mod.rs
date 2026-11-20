@@ -6,6 +6,7 @@ mod experience;
 mod icons;
 mod media;
 mod motion;
+mod notifications;
 mod oauth;
 mod track_table;
 mod updater;

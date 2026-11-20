@@ -242,6 +242,30 @@ pub fn window_icon() -> Option<egui::IconData> {
     })
 }
 
+pub fn app_logo(ui: &Ui, rect: Rect) {
+    let key = egui::Id::new("fnmusic-app-logo");
+    let texture = ui
+        .ctx()
+        .data(|data| data.get_temp::<egui::TextureHandle>(key))
+        .or_else(|| {
+            let image = super::artwork::decode(include_bytes!("../../assets/icon.png"))?;
+            let texture =
+                ui.ctx()
+                    .load_texture("application-logo", image, egui::TextureOptions::LINEAR);
+            ui.ctx()
+                .data_mut(|data| data.insert_temp(key, texture.clone()));
+            Some(texture)
+        });
+    if let Some(texture) = texture {
+        ui.painter().image(
+            texture.id(),
+            rect,
+            Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+    }
+}
+
 fn paint(ui: &Ui, center: Pos2, icon: Icon, color: Color32, selected: bool) {
     if paint_better_icon(ui, center, icon, color) {
         return;

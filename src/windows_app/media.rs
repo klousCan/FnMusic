@@ -155,6 +155,104 @@ mod tests {
         verify_playback(&address, "NAS FLAC");
     }
 
+    #[test]
+    #[ignore = "requires a signed-in NAS session and queue; plays muted for 45 seconds"]
+    fn real_nas_continuous_playback() {
+        let (runtime, session, track) = real_nas_track();
+        assert!(track.duration_ms > 45_000);
+        let relay = Relay::start(&runtime).unwrap();
+        let address = relay.issue(session, track.id, &track.format, None);
+        println!(
+            "Continuous playback format={}, duration_ms={}",
+            track.format, track.duration_ms
+        );
+        let media = Media::open(&address, 0.0).unwrap();
+        media.set_playing(true).unwrap();
+        let start = Instant::now();
+        while media.position().unwrap_or_default() < 45_000 {
+            if let Some(MediaEvent::Failed(reason)) = media.event() {
+                panic!(
+                    "Playback interrupted at {} ms: {reason}",
+                    media.position().unwrap_or_default()
+                );
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(90),
+                "playback timed out"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        println!("Continuous playback passed 45 seconds");
+        media.seek(10_000).unwrap();
+        wait_until("NAS cached backward seek", &media, |_| {
+            media
+                .position()
+                .is_some_and(|position| (10_000..15_000).contains(&position))
+        });
+        media.seek(60_000).unwrap();
+        wait_until("NAS cached forward seek", &media, |_| {
+            media
+                .position()
+                .is_some_and(|position| (60_000..65_000).contains(&position))
+        });
+        println!("NAS backward and forward seeks passed");
+    }
+
+    #[test]
+    #[ignore = "requires a signed-in NAS session; prints only range headers"]
+    fn inspect_real_nas_ranges() {
+        let (runtime, session, track) = real_nas_track();
+        runtime.block_on(async {
+            for start in [0, 524288, 1048576, 2097152, 3145728] {
+                let range = format!("bytes={start}-{}", start + 524287);
+                let response = session
+                    .stream(Method::GET, &track.id, None, Some(range.parse().unwrap()))
+                    .await
+                    .unwrap();
+                println!(
+                    "request={range}, status={}, range={:?}, length={:?}, type={:?}",
+                    response.status(),
+                    response.headers().get(header::CONTENT_RANGE),
+                    response.headers().get(header::CONTENT_LENGTH),
+                    response.headers().get(header::CONTENT_TYPE)
+                );
+            }
+        });
+    }
+
+    fn real_nas_track() -> (Runtime, std::sync::Arc<Session>, fnmusic::library::Track) {
+        let root = PathBuf::from(std::env::var_os("FNMUSIC_ACCEPTANCE_DATA_DIR").unwrap());
+        let mut credentials = super::super::vault::acceptance_credentials(&root).unwrap();
+        let queue_file = std::fs::read_dir(root.join("queues"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .max_by_key(|path| path.metadata().unwrap().modified().unwrap())
+            .unwrap();
+        let queue: fnmusic::playback::Queue =
+            serde_json::from_slice(&std::fs::read(queue_file).unwrap()).unwrap();
+        let track = queue.current().unwrap().clone();
+        let runtime = Runtime::new().unwrap();
+        let api = runtime.block_on(async {
+            let api = Api::new().unwrap();
+            if let Some(id) = credentials.fn_id.clone() {
+                let (api, base, _) = api.resolve_fn_connect(&id).await.unwrap();
+                credentials.base = base;
+                api
+            } else {
+                api.with_nas_certificate_compatibility(&credentials.base)
+                    .unwrap()
+            }
+        });
+        let session =
+            std::sync::Arc::new(Session::new(api, credentials, Box::new(ReadOnlySession)));
+        runtime.block_on(session.validate()).unwrap();
+        (runtime, session, track)
+    }
+
     fn verify_playback(address: &str, name: &str) {
         let media = Media::open(address, 0.0).unwrap();
         wait_until(name, &media, |event| {
