@@ -11,12 +11,46 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::spectrum::{Analyzer, BANDS};
 use reqwest::{
     StatusCode,
     blocking::{Client, Response},
     header::{CONTENT_RANGE, RANGE},
 };
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
+
+struct SpectrumState {
+    enabled: AtomicBool,
+    generation: AtomicU64,
+    levels: [AtomicU32; BANDS],
+}
+
+impl Default for SpectrumState {
+    fn default() -> Self {
+        Self {
+            enabled: AtomicBool::new(true),
+            generation: AtomicU64::new(0),
+            levels: std::array::from_fn(|_| AtomicU32::new(0)),
+        }
+    }
+}
+
+impl SpectrumState {
+    fn reset(&self) {
+        self.generation.fetch_add(1, Relaxed);
+        for level in &self.levels {
+            level.store(0, Relaxed);
+        }
+    }
+
+    fn publish(&self, generation: u64, levels: &[f32; BANDS]) {
+        if self.enabled.load(Relaxed) && self.generation.load(Relaxed) == generation {
+            for (target, level) in self.levels.iter().zip(levels) {
+                target.store(level.to_bits(), Relaxed);
+            }
+        }
+    }
+}
 
 pub enum MediaEvent {
     Opened,
@@ -36,6 +70,7 @@ struct State {
     seek: AtomicU64,
     device_failed: AtomicBool,
     recovering: AtomicBool,
+    spectrum: Arc<SpectrumState>,
 }
 
 const NO_SEEK: u64 = u64::MAX;
@@ -52,6 +87,7 @@ impl State {
     }
 
     fn make_sink(&self, mixer: &rodio::mixer::Mixer) -> Arc<Sink> {
+        self.spectrum.reset();
         let sink = Arc::new(Sink::connect_new(mixer));
         let mut current = self.sink.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(old) = current.replace(sink.clone()) {
@@ -101,6 +137,22 @@ impl Media {
 
     pub fn event(&self) -> Option<MediaEvent> {
         self.events.try_recv().ok()
+    }
+
+    pub fn set_spectrum_enabled(&self, enabled: bool) {
+        if self.state.spectrum.enabled.swap(enabled, Relaxed) != enabled {
+            self.state.spectrum.reset();
+        }
+    }
+
+    pub fn spectrum(&self) -> [f32; BANDS] {
+        if !self.state.spectrum.enabled.load(Relaxed)
+            || f32::from_bits(self.state.volume.load(Relaxed)) == 0.0
+            || !self.is_playing()
+        {
+            return [0.0; BANDS];
+        }
+        std::array::from_fn(|index| f32::from_bits(self.state.spectrum.levels[index].load(Relaxed)))
     }
 
     pub fn set_playing(&self, playing: bool) -> io::Result<()> {
@@ -212,6 +264,7 @@ fn play(url: url::Url, state: &Arc<State>, events: &Sender<MediaEvent>) -> io::R
     let _ = events.send(MediaEvent::Opened);
     let mut next_us = 0;
     let mut eof = false;
+    let mut analyzer = Analyzer::default();
     let mut recoveries = 0;
     let mut last_recovery = Instant::now();
     while !state.stopped.load(Relaxed) {
@@ -242,6 +295,7 @@ fn play(url: url::Url, state: &Arc<State>, events: &Sender<MediaEvent>) -> io::R
             }
             state.position.store(next_us, Relaxed);
             sink = state.make_sink(output.mixer());
+            analyzer.reset();
             state.recovering.store(false, Relaxed);
         }
         let request = state.seek.load(Relaxed);
@@ -250,6 +304,7 @@ fn play(url: url::Url, state: &Arc<State>, events: &Sender<MediaEvent>) -> io::R
                 Some(Ok(())) => {
                     next_us = request.saturating_mul(1000);
                     sink = state.make_sink(output.mixer());
+                    analyzer.reset();
                     state.position.store(next_us, Relaxed);
                     eof = false;
                 }
@@ -294,6 +349,14 @@ fn play(url: url::Url, state: &Arc<State>, events: &Sender<MediaEvent>) -> io::R
                 let samples_per_second = u64::from(channels) * u64::from(rate);
                 let length_us = samples.len() as u64 * 1_000_000 / samples_per_second;
                 sink.append(PlayedChunk {
+                    bands: if state.spectrum.enabled.load(Relaxed) {
+                        analyzer.analyze(&samples, channels, rate)
+                    } else {
+                        analyzer.reset();
+                        [0.0; BANDS]
+                    },
+                    spectrum: state.spectrum.clone(),
+                    generation: state.spectrum.generation.load(Relaxed),
                     data: samples.into_iter(),
                     position: state.position.clone(),
                     channels,
@@ -311,6 +374,9 @@ fn play(url: url::Url, state: &Arc<State>, events: &Sender<MediaEvent>) -> io::R
 }
 
 struct PlayedChunk {
+    spectrum: Arc<SpectrumState>,
+    generation: u64,
+    bands: [f32; BANDS],
     data: std::vec::IntoIter<f32>,
     position: Arc<AtomicU64>,
     channels: u16,
@@ -325,6 +391,11 @@ impl Iterator for PlayedChunk {
     fn next(&mut self) -> Option<f32> {
         let sample = self.data.next()?;
         self.consumed += 1;
+        if self.consumed == 1 {
+            // Publish the worker-computed FFT when these samples reach the output.
+            // The audio callback performs only bounded atomic stores.
+            self.spectrum.publish(self.generation, &self.bands);
+        }
         if self.consumed == 1 || self.consumed % 256 == 0 || self.data.len() == 0 {
             let frequency = u64::from(self.channels) * u64::from(self.rate);
             self.position.store(
@@ -692,6 +763,34 @@ mod tests {
     use super::*;
     use axum::{Router, extract::State, http::HeaderMap, response::IntoResponse, routing::get};
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn spectrum_is_published_at_consumption_and_old_chunks_cannot_restore_it_after_reset() {
+        let spectrum = Arc::new(SpectrumState::default());
+        let chunk = |generation| PlayedChunk {
+            spectrum: spectrum.clone(),
+            generation,
+            bands: [0.75; BANDS],
+            data: vec![0.25; 4].into_iter(),
+            position: Arc::new(AtomicU64::new(0)),
+            channels: 2,
+            rate: 48_000,
+            base_us: 0,
+            consumed: 0,
+        };
+        let mut current = chunk(0);
+        let mut old = chunk(0);
+        assert!(spectrum.levels.iter().all(|level| level.load(Relaxed) == 0));
+        assert_eq!(current.next(), Some(0.25));
+        assert_eq!(f32::from_bits(spectrum.levels[0].load(Relaxed)), 0.75);
+        spectrum.reset();
+        assert_eq!(old.next(), Some(0.25));
+        assert!(spectrum.levels.iter().all(|level| level.load(Relaxed) == 0));
+        spectrum.enabled.store(false, Relaxed);
+        let mut disabled = chunk(spectrum.generation.load(Relaxed));
+        disabled.next();
+        assert!(spectrum.levels.iter().all(|level| level.load(Relaxed) == 0));
+    }
 
     #[test]
     fn playback_and_seeks_share_one_response_when_playlist_lengths_change_between_requests() {

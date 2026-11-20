@@ -237,6 +237,7 @@ pub struct MusicApp {
     lyrics_detail: bool,
     detail_lyrics_enabled: bool,
     detail_record: super::motion::RecordRotation,
+    spectrum_view: super::spectrum::SpectrumView,
     covers: HashMap<String, Cover>,
     cover_limit: Arc<Semaphore>,
     cover_clock: u64,
@@ -1098,6 +1099,7 @@ impl MusicApp {
             lyrics_detail: false,
             detail_lyrics_enabled: true,
             detail_record: super::motion::RecordRotation::default(),
+            spectrum_view: super::spectrum::SpectrumView::default(),
             covers: HashMap::new(),
             cover_limit: Arc::new(Semaphore::new(3)),
             cover_clock: 0,
@@ -2106,6 +2108,7 @@ impl MusicApp {
         );
         match Media::open(&address, self.queue.volume) {
             Ok(media) => {
+                media.set_spectrum_enabled(self.preferences.show_spectrum && !self.lyrics_detail);
                 self.media = Some(media);
                 self.media_open = false;
                 self.playing = true;
@@ -2338,6 +2341,16 @@ impl MusicApp {
     }
 
     fn update_media(&mut self) {
+        if let Some(media) = &self.media {
+            media.set_spectrum_enabled(
+                self.preferences.show_spectrum
+                    && !self.lyrics_detail
+                    && !self
+                        .events
+                        .ctx
+                        .input(|input| input.viewport().minimized.unwrap_or(false)),
+            );
+        }
         let sleep_expired = self.sleep_timer.poll(Instant::now());
         if sleep_expired {
             self.pause_for_sleep();
@@ -3474,6 +3487,18 @@ impl MusicApp {
             .show(ctx, |ui| {
                 let track = self.queue.current().cloned();
                 let enabled = track.is_some();
+                let levels = self
+                    .media
+                    .as_ref()
+                    .map(Media::spectrum)
+                    .unwrap_or([0.0; fnmusic::spectrum::BANDS]);
+                self.spectrum_view.paint(
+                    ui,
+                    ui.max_rect().expand(12.0),
+                    levels,
+                    self.preferences.show_spectrum,
+                    self.playing,
+                );
                 const TRANSPORT_WIDTH: f32 = 4.0 * 32.0 + 44.0 + 4.0 * 6.0;
                 let (header, _) = ui.allocate_exact_size(
                     Vec2::new(ui.available_width(), 48.0),
@@ -3599,7 +3624,29 @@ impl MusicApp {
         {
             self.toggle_panel(Panel::Queue);
         }
-        let volume_width = (ui.available_width() - 38.0).clamp(36.0, 92.0);
+        if icons::small(
+            ui,
+            Icon::Spectrum,
+            if self.preferences.show_spectrum {
+                "隐藏频谱"
+            } else {
+                "显示频谱"
+            },
+            self.preferences.show_spectrum,
+        )
+        .clicked()
+        {
+            self.preferences.show_spectrum = !self.preferences.show_spectrum;
+            if self.vault.save_preferences(&self.preferences).is_err() {
+                self.notifications.error(
+                    "频谱设置保存失败",
+                    "请检查本地存储是否可写。",
+                    "频谱显示设置未能保存",
+                    None,
+                );
+            }
+        }
+        let volume_width = (ui.available_width() - 86.0).clamp(24.0, 92.0);
         let mut volume = self.queue.volume;
         let slider = playback_slider(ui, volume_width, false, |ui| {
             ui.add(

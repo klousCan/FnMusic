@@ -5,4 +5,5 @@ pub mod library;
 pub mod playback;
 pub mod recommendation;
 pub mod relay;
+pub mod spectrum;
 pub mod storage;

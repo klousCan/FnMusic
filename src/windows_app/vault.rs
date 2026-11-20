@@ -59,6 +59,7 @@ pub enum AnimationMode {
 #[serde(default)]
 pub struct Preferences {
     pub auto_check_updates: bool,
+    pub show_spectrum: bool,
     pub animation_mode: AnimationMode,
     pub close_to_tray: bool,
     pub color_mode: ColorMode,
@@ -71,6 +72,7 @@ impl Default for Preferences {
     fn default() -> Self {
         Self {
             auto_check_updates: true,
+            show_spectrum: true,
             animation_mode: AnimationMode::On,
             close_to_tray: true,
             color_mode: ColorMode::System,
@@ -267,6 +269,7 @@ mod tests {
         let preferences: super::Preferences =
             serde_json::from_str(r#"{"close_to_tray":false}"#).unwrap();
         assert!(!preferences.close_to_tray);
+        assert!(preferences.show_spectrum);
         assert_eq!(preferences.color_mode, super::ColorMode::System);
         assert_eq!(preferences.accent, super::Accent::Red);
         assert!(preferences.wallpaper_path.is_none());

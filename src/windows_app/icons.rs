@@ -48,6 +48,7 @@ pub enum Icon {
     Tray,
     Sun,
     Palette,
+    Spectrum,
 }
 
 pub fn small(ui: &mut Ui, icon: Icon, label: &str, selected: bool) -> Response {
@@ -483,6 +484,13 @@ fn paint(ui: &Ui, center: Pos2, icon: Icon, color: Color32, selected: bool) {
         | Icon::Palette => {
             box_outline(-6.0, -6.0, 6.0, 6.0);
         }
+        Icon::Spectrum => {
+            line(&[(-7.0, -2.0), (-7.0, 2.0)]);
+            line(&[(-3.5, -5.0), (-3.5, 5.0)]);
+            line(&[(0.0, -7.0), (0.0, 7.0)]);
+            line(&[(3.5, -4.0), (3.5, 4.0)]);
+            line(&[(7.0, -2.0), (7.0, 2.0)]);
+        }
         Icon::Volume | Icon::Mute => {
             line(&[
                 (-8.0, -3.0),
@@ -546,6 +554,7 @@ fn paint_better_icon(ui: &Ui, center: Pos2, icon: Icon, color: Color32) -> bool 
 
 fn tabler_body(icon: Icon) -> &'static str {
     match icon {
+        Icon::Spectrum => r#"<path d="M3 10v4M7.5 6v12M12 3v18M16.5 7v10M21 10v4"/>"#,
         Icon::Home => {
             r#"<path d="M5 12l7 -7l7 7v8a2 2 0 0 1 -2 2h-10a2 2 0 0 1 -2 -2z"/><path d="M9 22v-6h6v6"/>"#
         }

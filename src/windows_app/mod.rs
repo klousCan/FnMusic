@@ -8,6 +8,7 @@ mod media;
 mod motion;
 mod notifications;
 mod oauth;
+mod spectrum;
 mod track_table;
 mod updater;
 mod vault;
