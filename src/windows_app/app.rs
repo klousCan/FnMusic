@@ -36,6 +36,9 @@ use super::{
 pub(super) const ACCENT: Color32 = Color32::from_rgb(235, 54, 87);
 const COVER_CAPACITY: usize = 240;
 const SIDEBAR_BREAKPOINT: f32 = 980.0;
+const SIDEBAR_WIDTH: f32 = 220.0;
+const TRACK_ROW_HEIGHT: f32 = 56.0;
+const TRACK_COVER_SIZE: f32 = 38.0;
 const PANEL_BREAKPOINT: f32 = 1240.0;
 const TITLE_BAR_HEIGHT: f32 = 48.0;
 const HISTORY_LIMIT: usize = 40;
@@ -797,8 +800,8 @@ impl MusicApp {
         let initial = name.chars().next().unwrap_or('用');
         let name: String = name.chars().take(12).collect();
         let button = egui::Button::new("")
-            .min_size(Vec2::new(ui.available_width(), 44.0))
-            .corner_radius(10.0)
+            .min_size(Vec2::new(ui.available_width(), 48.0))
+            .corner_radius(12.0)
             .fill(ui.visuals().faint_bg_color);
         let response = egui::menu::menu_custom_button(ui, button, |ui| {
             super::motion::popup(ui);
@@ -960,13 +963,13 @@ impl MusicApp {
             if compact {
                 rect.center().x
             } else {
-                rect.left() + 22.0
+                rect.left() + 27.0
             },
             rect.center().y,
         );
         let accent = ui.visuals().hyperlink_color;
         ui.painter()
-            .circle_filled(center, 14.0, accent.gamma_multiply(0.14));
+            .circle_filled(center, 16.0, accent.gamma_multiply(0.14));
         ui.painter().text(
             center,
             egui::Align2::CENTER_CENTER,
@@ -977,14 +980,14 @@ impl MusicApp {
         if !compact {
             let mut job = egui::text::LayoutJob::simple_singleline(
                 name,
-                egui::FontId::proportional(13.0),
+                egui::FontId::proportional(14.0),
                 ui.visuals().text_color(),
             );
             job.wrap.max_width = (rect.width() - 63.0).max(0.0);
             job.wrap.max_rows = 1;
             let galley = ui.painter().layout_job(job);
             ui.painter().galley(
-                egui::pos2(rect.left() + 43.0, center.y - galley.size().y * 0.5),
+                egui::pos2(rect.left() + 53.0, center.y - galley.size().y * 0.5),
                 galley,
                 ui.visuals().text_color(),
             );
@@ -1000,31 +1003,40 @@ impl MusicApp {
         }
     }
 
-    fn primary_action(&self, ui: &mut egui::Ui, label: &str) -> egui::Response {
-        let size = Vec2::new(116.0, 34.0);
+    fn library_action(&self, ui: &mut egui::Ui, icon: Icon, label: &str) -> egui::Response {
+        let primary = icon == Icon::Play;
+        let size = Vec2::new(if primary { 116.0 } else { 138.0 }, 36.0);
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
         let accent = ui.visuals().hyperlink_color;
-        let fill = if response.is_pointer_button_down_on() {
+        let fill = if !primary {
+            let state = ui.style().interact(&response);
+            state.weak_bg_fill
+        } else if response.is_pointer_button_down_on() {
             accent.gamma_multiply(0.74)
         } else if response.hovered() {
             accent.gamma_multiply(1.10)
         } else {
             accent
         };
-        ui.painter().rect_filled(rect, 17.0, fill);
+        let text_color = if primary {
+            Color32::WHITE
+        } else {
+            ui.visuals().text_color()
+        };
+        ui.painter().rect_filled(rect, 10.0, fill);
         icons::glyph(
             ui,
             egui::pos2(rect.left() + 17.0, rect.center().y),
-            Icon::Play,
-            Color32::WHITE,
+            icon,
+            text_color,
         );
         ui.painter().text(
             egui::pos2(rect.left() + 30.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
             label,
             egui::FontId::proportional(14.0),
-            Color32::WHITE,
+            text_color,
         );
         response.on_hover_text(label)
     }
@@ -2530,7 +2542,7 @@ impl MusicApp {
 
     fn sidebar_width(&self, ctx: &egui::Context) -> f32 {
         let compact = self.sidebar_collapsed || ctx.screen_rect().width() < SIDEBAR_BREAKPOINT;
-        let width = if compact { 64.0 } else { 190.0 };
+        let width = if compact { 64.0 } else { SIDEBAR_WIDTH };
         ctx.animate_value_with_time(
             egui::Id::new("sidebar-width"),
             width,
@@ -2568,16 +2580,20 @@ impl MusicApp {
         let width = self.sidebar_width(ctx);
         // Delay expanded content until it fits; do not let text force the
         // animated panel beyond its requested width.
-        let compact = compact || width < 182.0;
+        let compact = compact || width < 190.0;
         let fill = Self::sidebar_background(ctx);
         egui::SidePanel::left("sidebar")
             .exact_width(width)
             .resizable(false)
             .frame(Frame::new().fill(fill).inner_margin(12))
             .show(ctx, |ui| {
-                ui.add_space(4.0);
+                ui.spacing_mut().item_spacing.y = 3.0;
+                ui.add_space(6.0);
                 if !compact {
-                    ui.label(RichText::new("资料库").small().weak().strong());
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(RichText::new("资料库").size(12.0).color(widgets::secondary_text(ui)));
+                    });
                 }
                 ui.add_space(4.0);
                 let highlight = ui.painter().add(egui::Shape::Noop);
@@ -2598,7 +2614,7 @@ impl MusicApp {
                         label,
                         (!compact).then_some(label),
                         selected,
-                        Vec2::new(ui.available_width(), 32.0),
+                        Vec2::new(ui.available_width(), if compact { 32.0 } else { 38.0 }),
                     );
                     if selected {
                         let origin = ui.min_rect().top();
@@ -2613,7 +2629,7 @@ impl MusicApp {
                             .shrink(1.0);
                         ui.painter().set(
                             highlight,
-                            egui::Shape::rect_filled(rect, 7.0, ui.visuals().selection.bg_fill),
+                            egui::Shape::rect_filled(rect, 10.0, ui.visuals().selection.bg_fill),
                         );
                     }
                     if page == Page::Favorites
@@ -2627,9 +2643,13 @@ impl MusicApp {
                         self.open_page(page, true);
                     }
                 }
-                if !compact && !self.sidebar_playlists.is_empty() && ui.available_height() > 92.0 {
-                    ui.add_space(10.0);
-                    ui.label(RichText::new("我的歌单").small().weak().strong());
+                if !compact && !self.sidebar_playlists.is_empty() && ui.available_height() > 120.0 {
+                    ui.add_space(18.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        ui.label(RichText::new("我的歌单").size(12.0).color(widgets::secondary_text(ui)));
+                    });
+                    ui.add_space(4.0);
                     egui::ScrollArea::vertical()
                         .id_salt("sidebar-playlists")
                         .max_height(ui.available_height() - 72.0)
@@ -2648,10 +2668,10 @@ impl MusicApp {
                                         );
                                         egui::Image::new((texture.id(), thumbnail.size()))
                                             .uv(uv)
-                                            .corner_radius(5)
+                                            .corner_radius(7)
                                             .paint_at(ui, thumbnail);
                                     } else {
-                                        ui.painter().rect_filled(thumbnail, 5, ui.visuals().faint_bg_color);
+                                        ui.painter().rect_filled(thumbnail, 7, ui.visuals().faint_bg_color);
                                         icons::glyph(ui, thumbnail.center(), Icon::Playlist, widgets::secondary_text(ui));
                                     }
                                 }
@@ -2841,7 +2861,7 @@ impl MusicApp {
                 .layout(Layout::left_to_right(Align::Center)),
         );
         controls.add_enabled_ui(ready, |ui| {
-            play = self.primary_action(ui, "立即播放").clicked();
+            play = self.library_action(ui, Icon::Play, "立即播放").clicked();
         });
         controls.add_space(6.0);
         open |= widgets::pill(&mut controls, Icon::Forward, "查看推荐").clicked();
@@ -2856,7 +2876,7 @@ impl MusicApp {
             .frame(
                 Frame::new()
                     .fill(ctx.style().visuals.panel_fill)
-                    .inner_margin(18),
+                    .inner_margin(24),
             )
             .show(ctx, |ui| {
                 ui.set_opacity(super::motion::reveal(
@@ -2876,7 +2896,7 @@ impl MusicApp {
                 }
                 let scroll = area.show(ui, |ui| {
                     let title = self.page.title().to_owned();
-                    ui.label(RichText::new(title).size(32.0).strong());
+                    ui.label(RichText::new(title).size(34.0).strong());
                     let subtitle = match &self.page {
                         Page::Home => Some("来自 NAS 的音乐资料库".to_owned()),
                         Page::Daily => Some(format!(
@@ -2888,19 +2908,26 @@ impl MusicApp {
                         _ => None,
                     };
                     if let Some(subtitle) = subtitle.filter(|text| !text.is_empty()) {
-                        ui.label(RichText::new(subtitle).weak());
+                        ui.label(
+                            RichText::new(subtitle)
+                                .size(13.0)
+                                .color(widgets::secondary_text(ui)),
+                        );
                     }
-                    ui.add_space(9.0);
+                    ui.add_space(14.0);
 
                     if self.page == Page::Home {
                         open_daily = self.daily_banner(ui);
                         ui.add_space(16.0);
                     } else if self.page == Page::Daily && !self.listing.tracks.is_empty() {
                         ui.horizontal(|ui| {
-                            if self.primary_action(ui, "播放全部").clicked() {
+                            if self.library_action(ui, Icon::Play, "播放全部").clicked() {
                                 play = Some(0);
                             }
-                            if widgets::pill(ui, Icon::Queue, "加入播放列表").clicked() {
+                            if self
+                                .library_action(ui, Icon::Queue, "加入播放列表")
+                                .clicked()
+                            {
                                 for track in self.listing.tracks.clone() {
                                     self.add_to_queue(track, false);
                                 }
@@ -2910,14 +2937,14 @@ impl MusicApp {
                                 ));
                             }
                         });
-                        ui.add_space(10.0);
+                        ui.add_space(14.0);
                     }
 
                     if let Page::Detail(collection) = self.page.clone() {
                         ui.horizontal(|ui| {
                             self.art(ui, &collection.cover, &collection.title, 84.0);
                             if !self.listing.tracks.is_empty()
-                                && self.primary_action(ui, "播放全部").clicked()
+                                && self.library_action(ui, Icon::Play, "播放全部").clicked()
                             {
                                 play = Some(0);
                             }
@@ -3090,7 +3117,7 @@ impl MusicApp {
             for _ in 0..if self.page_number == 0 { 6 } else { 2 } {
                 ui.horizontal(|ui| {
                     let rect = ui
-                        .allocate_exact_size(Vec2::splat(34.0), egui::Sense::hover())
+                        .allocate_exact_size(Vec2::splat(TRACK_COVER_SIZE), egui::Sense::hover())
                         .0;
                     super::motion::skeleton(ui, rect, 7);
                     ui.vertical(|ui| {
@@ -3102,7 +3129,7 @@ impl MusicApp {
                         }
                     });
                 });
-                ui.add_space(8.0);
+                ui.add_space(12.0);
             }
         }
     }
@@ -3156,7 +3183,7 @@ impl MusicApp {
                                 }
                             }
                             let title = ui.add(
-                                egui::Button::new(RichText::new(&card.title).strong())
+                                egui::Button::new(RichText::new(&card.title).size(15.0).strong())
                                     .frame(false)
                                     .truncate(),
                             );
@@ -3164,8 +3191,12 @@ impl MusicApp {
                                 selected = Some(card.clone());
                             }
                             ui.add(
-                                egui::Label::new(RichText::new(&card.subtitle).small().weak())
-                                    .truncate(),
+                                egui::Label::new(
+                                    RichText::new(&card.subtitle)
+                                        .size(13.0)
+                                        .color(widgets::secondary_text(ui)),
+                                )
+                                .truncate(),
                             );
                         },
                     );
@@ -3177,26 +3208,40 @@ impl MusicApp {
     }
 
     fn track_list(&mut self, ui: &mut egui::Ui) -> Option<usize> {
-        const ROW_HEIGHT: f32 = 46.0;
-        const ART_COLUMN: f32 = 47.0;
+        const ROW_HEIGHT: f32 = TRACK_ROW_HEIGHT;
         const ACTIONS: f32 = 102.0;
+        const DURATION: f32 = 58.0;
 
-        let width = ui.available_width();
-        let artist = if width >= 600.0 { width * 0.20 } else { 0.0 };
-        let album = if width >= 760.0 { width * 0.21 } else { 0.0 };
+        let rows = self.listing.tracks.len();
+        let number_width = 32.0 + 7.0 * rows.to_string().len().saturating_sub(2) as f32;
+        let art_column = number_width + 46.0;
+        let width = (ui.available_width() - 8.0).max(0.0);
+        let artist = if width >= 470.0 { width * 0.19 } else { 0.0 };
+        let album = if width >= 630.0 { width * 0.22 } else { 0.0 };
         let columns = [
             (
                 Column::Title,
-                (width - ART_COLUMN - ACTIONS - artist - album - 58.0).max(40.0),
+                (width - art_column - ACTIONS - artist - album - DURATION).max(40.0),
             ),
             (Column::Artist, artist),
             (Column::Album, album),
-            (Column::Duration, 58.0),
+            (Column::Duration, DURATION),
         ];
         let list_id = ui.make_persistent_id("track-list");
         let header = ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            ui.add_space(ART_COLUMN);
+            let muted = widgets::secondary_text(ui);
+            let (number, _) =
+                ui.allocate_exact_size(egui::vec2(art_column, 30.0), egui::Sense::hover());
+            paint_track_text(
+                ui,
+                number.left() + 9.0,
+                number.center().y,
+                number_width,
+                "#",
+                muted,
+                12.0,
+            );
             for (column, width) in columns.into_iter().filter(|(_, width)| *width > 0.0) {
                 let sort = self
                     .track_table
@@ -3207,10 +3252,18 @@ impl MusicApp {
                     Some((_, false)) => format!("{} ↑", column.title()),
                     None => column.title().into(),
                 };
-                let button = egui::Button::new(RichText::new(title).weak())
-                    .frame(false)
-                    .truncate();
-                if ui.add_sized([width, 26.0], button).clicked() {
+                let (cell, response) =
+                    ui.allocate_exact_size(egui::vec2(width, 30.0), egui::Sense::click());
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &title)
+                });
+                let color = if response.hovered() || response.has_focus() {
+                    ui.visuals().text_color()
+                } else {
+                    muted
+                };
+                paint_track_text(ui, cell.left(), cell.center().y, width, &title, color, 12.0);
+                if response.clicked() {
                     self.track_table
                         .toggle_sort(column, &mut self.listing.tracks);
                 }
@@ -3222,9 +3275,8 @@ impl MusicApp {
             egui::Sense::focusable_noninteractive(),
         )
         .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "歌曲列表"));
-        ui.separator();
+        ui.add_space(4.0);
 
-        let rows = self.listing.tracks.len();
         let row_top = ui.next_widget_position();
         let mut play = None;
         if ui.memory(|memory| memory.has_focus(list_id)) {
@@ -3310,11 +3362,22 @@ impl MusicApp {
                     } else {
                         ui.visuals().widgets.hovered.weak_bg_fill
                     };
-                    ui.painter().rect_filled(rect.shrink(1.0), 6.0, fill);
+                    ui.painter()
+                        .rect_filled(rect.shrink2(egui::vec2(0.0, 2.0)), 10.0, fill);
                 }
+                let muted = widgets::secondary_text(ui);
+                paint_track_text(
+                    ui,
+                    rect.left() + 9.0,
+                    rect.center().y,
+                    number_width,
+                    &format!("{:02}", index + 1),
+                    muted,
+                    12.0,
+                );
                 let cover = egui::Rect::from_center_size(
-                    egui::pos2(rect.left() + 22.0, rect.center().y),
-                    Vec2::splat(34.0),
+                    egui::pos2(rect.left() + number_width + 16.0, rect.center().y),
+                    Vec2::splat(TRACK_COVER_SIZE),
                 );
                 if ui.is_rect_visible(cover) {
                     self.paint_cover(ui, cover, &track.cover, &track.title);
@@ -3336,7 +3399,7 @@ impl MusicApp {
                 } else {
                     ui.visuals().text_color()
                 };
-                let mut x = rect.left() + ART_COLUMN;
+                let mut x = rect.left() + art_column;
                 for (column, width) in columns.into_iter().filter(|(_, width)| *width > 0.0) {
                     let duration;
                     let text = match column {
@@ -3349,18 +3412,25 @@ impl MusicApp {
                         }
                     };
                     if column == Column::Title && artist == 0.0 {
-                        paint_track_text(ui, x, rect.center().y - 8.0, width, text, color, 14.0);
+                        paint_track_text(ui, x, rect.center().y - 8.0, width, text, color, 15.0);
                         paint_track_text(
                             ui,
                             x,
                             rect.center().y + 9.0,
                             width,
                             &track.artist,
-                            color,
+                            muted,
                             12.0,
                         );
                     } else {
-                        paint_track_text(ui, x, rect.center().y, width, text, color, 14.0);
+                        let (color, size) = if column == Column::Title {
+                            (color, 15.0)
+                        } else if column == Column::Duration {
+                            (muted, 12.0)
+                        } else {
+                            (muted, 13.0)
+                        };
+                        paint_track_text(ui, x, rect.center().y, width, text, color, size);
                     }
                     x += width;
                 }
@@ -3369,8 +3439,8 @@ impl MusicApp {
                     egui::UiBuilder::new()
                         .id_salt(row_id.with("actions"))
                         .max_rect(egui::Rect::from_min_max(
-                            egui::pos2(x, rect.top() + 8.0),
-                            rect.right_bottom(),
+                            egui::pos2(x, rect.center().y - 15.0),
+                            egui::pos2(rect.right(), rect.center().y + 15.0),
                         ))
                         .layout(Layout::left_to_right(Align::Min)),
                 );
@@ -5523,9 +5593,9 @@ mod tests {
         app.panel = Panel::Lyrics;
         for (width, sidebar_width, docked) in [
             (979.0, 64.0, false),
-            (980.0, 190.0, false),
-            (1239.0, 190.0, false),
-            (1240.0, 190.0, true),
+            (980.0, SIDEBAR_WIDTH, false),
+            (1239.0, SIDEBAR_WIDTH, false),
+            (1240.0, SIDEBAR_WIDTH, true),
         ] {
             let ctx = egui::Context::default();
             draw(app, &ctx, width, Vec::new());

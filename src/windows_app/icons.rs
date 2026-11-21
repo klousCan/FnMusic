@@ -176,7 +176,7 @@ fn button_impl(
         if (selected && paint_selection) || (!selected && hover > 0.0) {
             ui.painter().rect(
                 rect.shrink(1.0 + pressed),
-                7.0,
+                if paint_selection { 7.0 } else { 10.0 },
                 style
                     .weak_bg_fill
                     .gamma_multiply(if selected { 1.0 } else { hover }),
@@ -184,7 +184,9 @@ fn button_impl(
                 StrokeKind::Inside,
             );
         }
-        let color = if selected && (!paint_selection || caption.is_some()) && ui.is_enabled() {
+        let color = if selected && !paint_selection && ui.is_enabled() {
+            ui.visuals().hyperlink_color
+        } else if selected && caption.is_some() && ui.is_enabled() {
             ui.visuals().selection.stroke.color
         } else if selected && ui.is_enabled() {
             ui.visuals().hyperlink_color
@@ -192,7 +194,10 @@ fn button_impl(
             style.fg_stroke.color
         };
         let center = if caption.is_some() {
-            pos2(rect.left() + 17.0, rect.center().y)
+            pos2(
+                rect.left() + if paint_selection { 17.0 } else { 22.0 },
+                rect.center().y,
+            )
         } else {
             rect.center()
         };
@@ -212,16 +217,26 @@ fn button_impl(
         }
         paint(ui, center + vec2(0.0, pressed), icon, color, selected);
         if let Some(caption) = caption {
+            let left = if paint_selection { 34.0 } else { 44.0 };
+            let color = if paint_selection {
+                color
+            } else {
+                ui.visuals().text_color()
+            };
             let mut job = egui::text::LayoutJob::simple_singleline(
                 caption.into(),
-                egui::TextStyle::Button.resolve(ui.style()),
+                if paint_selection {
+                    egui::TextStyle::Button.resolve(ui.style())
+                } else {
+                    egui::FontId::proportional(15.0)
+                },
                 color,
             );
-            job.wrap.max_width = (rect.width() - 38.0).max(0.0);
+            job.wrap.max_width = (rect.width() - left - 8.0).max(0.0);
             job.wrap.max_rows = 1;
             let galley = ui.painter().layout_job(job);
             ui.painter().galley(
-                pos2(rect.left() + 34.0, center.y - galley.size().y * 0.5),
+                pos2(rect.left() + left, center.y - galley.size().y * 0.5),
                 galley,
                 color,
             );

@@ -52,7 +52,7 @@ fn text(ui: &Ui, position: egui::Pos2, width: f32, value: &str, size: f32, color
     ui.painter().galley(position, galley, color);
 }
 
-pub const PLAYLIST_ROW_HEIGHT: f32 = 36.0;
+pub const PLAYLIST_ROW_HEIGHT: f32 = 48.0;
 
 pub fn playlist_row(ui: &mut Ui, label: &str, selected: bool) -> (Response, egui::Rect) {
     let (rect, response) = ui.allocate_exact_size(
@@ -68,7 +68,7 @@ pub fn playlist_row(ui: &mut Ui, label: &str, selected: bool) -> (Response, egui
         )
     });
     let thumbnail =
-        egui::Rect::from_center_size(rect.left_center() + vec2(20.0, 0.0), vec2(26.0, 26.0))
+        egui::Rect::from_center_size(rect.left_center() + vec2(27.0, 0.0), vec2(34.0, 34.0))
             .round_to_pixels(ui.ctx().pixels_per_point());
     if ui.is_rect_visible(rect) {
         let visuals = ui.visuals();
@@ -84,22 +84,22 @@ pub fn playlist_row(ui: &mut Ui, label: &str, selected: bool) -> (Response, egui
                     response.hovered() || response.has_focus(),
                 ))
         };
-        ui.painter().rect_filled(rect, 8, fill);
+        ui.painter().rect_filled(rect, 10, fill);
         if response.has_focus() {
             ui.painter().rect_stroke(
                 rect.shrink(0.5),
-                8,
+                10,
                 Stroke::new(1.0_f32, visuals.hyperlink_color),
                 StrokeKind::Inside,
             );
         }
-        let title_left = thumbnail.right() + 9.0;
+        let title_left = thumbnail.right() + 11.0;
         text(
             ui,
             pos2(title_left, rect.center().y),
             rect.right() - title_left - 8.0,
             label,
-            13.0,
+            15.0,
             visuals.text_color(),
         );
     }
