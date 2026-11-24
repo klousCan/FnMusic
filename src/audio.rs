@@ -4,7 +4,10 @@ use std::{
     io::{self, BufReader, Read, Seek, SeekFrom, Write},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed},
+        atomic::{
+            AtomicBool, AtomicU32, AtomicU64,
+            Ordering::{Acquire, Relaxed, Release},
+        },
         mpsc::{self, Receiver, Sender},
     },
     thread,
@@ -18,6 +21,80 @@ use reqwest::{
     header::{CONTENT_RANGE, RANGE},
 };
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
+
+#[derive(Clone)]
+struct MixTarget {
+    mixer: rodio::mixer::Mixer,
+    channels: u16,
+    rate: u32,
+    failed: Arc<AtomicBool>,
+}
+
+struct Endpoint {
+    _stream: OutputStream,
+    target: MixTarget,
+}
+
+type SharedOutput = Arc<Mutex<Option<Endpoint>>>;
+
+#[derive(Default)]
+struct StartGate {
+    open: AtomicBool,
+    predecessor: Option<Arc<AtomicBool>>,
+}
+
+struct GatedOutput {
+    source: rodio::queue::SourcesQueueOutput,
+    gate: Option<Arc<StartGate>>,
+    stopped: Arc<AtomicBool>,
+    revision: Arc<AtomicU64>,
+    generation: u64,
+    channels: u16,
+    rate: u32,
+    opened: bool,
+    channel: u16,
+}
+
+impl Iterator for GatedOutput {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        if self.stopped.load(Relaxed) || self.revision.load(Relaxed) != self.generation {
+            return None;
+        }
+        if !self.opened {
+            if self.channel == 0 {
+                self.opened = self.gate.as_ref().is_none_or(|gate| {
+                    gate.open.load(Acquire)
+                        || gate
+                            .predecessor
+                            .as_ref()
+                            .is_some_and(|finished| finished.load(Acquire))
+                });
+            }
+            self.channel = (self.channel + 1) % self.channels;
+            if !self.opened {
+                return Some(0.0);
+            }
+        }
+        self.source.next()
+    }
+}
+
+impl Source for GatedOutput {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+    fn sample_rate(&self) -> u32 {
+        self.rate
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+}
 
 struct SpectrumState {
     enabled: AtomicBool,
@@ -62,15 +139,20 @@ pub enum MediaEvent {
 #[derive(Default)]
 struct State {
     sink: Mutex<Option<Arc<Sink>>>,
-    stopped: AtomicBool,
+    stopped: Arc<AtomicBool>,
     playing: AtomicBool,
     volume: AtomicU32,
+    gain: AtomicU32,
     position: Arc<AtomicU64>,
     duration: AtomicU64,
     seek: AtomicU64,
     device_failed: AtomicBool,
     recovering: AtomicBool,
     spectrum: Arc<SpectrumState>,
+    ready: AtomicBool,
+    finished: Arc<AtomicBool>,
+    end_revision: Arc<AtomicU64>,
+    gate: Option<Arc<StartGate>>,
 }
 
 const NO_SEEK: u64 = u64::MAX;
@@ -86,9 +168,13 @@ impl State {
             .clone()
     }
 
-    fn make_sink(&self, mixer: &rodio::mixer::Mixer) -> Arc<Sink> {
+    fn make_sink(&self, target: &MixTarget) -> Arc<Sink> {
         self.spectrum.reset();
-        let sink = Arc::new(Sink::connect_new(mixer));
+        self.end_revision.fetch_add(1, Relaxed);
+        self.finished.store(false, Relaxed);
+        self.ready.store(false, Relaxed);
+        let (sink, source) = Sink::new();
+        let sink = Arc::new(sink);
         let mut current = self.sink.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(old) = current.replace(sink.clone()) {
             old.stop();
@@ -96,18 +182,53 @@ impl State {
         if !self.playing.load(Relaxed) {
             sink.pause();
         }
-        sink.set_volume(f32::from_bits(self.volume.load(Relaxed)));
+        self.apply_volume(&sink);
+        target.mixer.add(GatedOutput {
+            source,
+            gate: self.gate.clone(),
+            stopped: self.stopped.clone(),
+            revision: self.end_revision.clone(),
+            generation: self.end_revision.load(Relaxed),
+            channels: target.channels,
+            rate: target.rate,
+            opened: self.gate.is_none(),
+            channel: 0,
+        });
         sink
+    }
+
+    fn apply_volume(&self, sink: &Sink) {
+        sink.set_volume(
+            f32::from_bits(self.volume.load(Relaxed)) * f32::from_bits(self.gain.load(Relaxed)),
+        );
     }
 }
 
 pub struct Media {
     state: Arc<State>,
     events: Receiver<MediaEvent>,
+    output: SharedOutput,
 }
 
 impl Media {
     pub fn open(address: &str, volume: f32) -> io::Result<Self> {
+        Self::open_using(address, volume, SharedOutput::default(), None)
+    }
+
+    pub fn prepare(&self, address: &str, volume: f32, gapless: bool) -> io::Result<Self> {
+        let gate = StartGate {
+            open: AtomicBool::new(false),
+            predecessor: gapless.then(|| self.state.finished.clone()),
+        };
+        Self::open_using(address, volume, self.output.clone(), Some(Arc::new(gate)))
+    }
+
+    fn open_using(
+        address: &str,
+        volume: f32,
+        output: SharedOutput,
+        gate: Option<Arc<StartGate>>,
+    ) -> io::Result<Self> {
         let url = url::Url::parse(address).map_err(io::Error::other)?;
         if url.scheme() != "http" || url.host_str() != Some("127.0.0.1") {
             return Err(io::Error::new(
@@ -117,22 +238,47 @@ impl Media {
         }
         let state = Arc::new(State {
             volume: AtomicU32::new(volume.to_bits()),
+            gain: AtomicU32::new(1.0_f32.to_bits()),
+            playing: AtomicBool::new(gate.is_some()),
+            gate,
             seek: AtomicU64::new(NO_SEEK),
             ..State::default()
         });
         let (sender, events) = mpsc::channel();
         let worker = state.clone();
+        let worker_output = output.clone();
         thread::Builder::new()
             .name("fnmusic-audio".into())
             .spawn(move || {
-                let result = play(url, &worker, &sender);
+                let result = play(url, &worker, &sender, &worker_output);
                 if let Err(error) = result
                     && !worker.stopped.load(Relaxed)
                 {
                     let _ = sender.send(MediaEvent::Failed(error.to_string()));
                 }
             })?;
-        Ok(Self { state, events })
+        Ok(Self {
+            state,
+            events,
+            output,
+        })
+    }
+
+    pub fn ready(&self) -> bool {
+        self.state.ready.load(Acquire)
+    }
+
+    pub fn activate(&self) {
+        if let Some(gate) = &self.state.gate {
+            gate.open.store(true, Release);
+        }
+    }
+
+    pub fn set_gain(&self, gain: f32) {
+        self.state.gain.store(gain.to_bits(), Relaxed);
+        if let Some(sink) = self.state.sink() {
+            self.state.apply_volume(&sink);
+        }
     }
 
     pub fn event(&self) -> Option<MediaEvent> {
@@ -196,7 +342,7 @@ impl Media {
     pub fn volume(&self, volume: f32) -> io::Result<()> {
         self.state.volume.store(volume.to_bits(), Relaxed);
         if let Some(sink) = self.state.sink() {
-            sink.set_volume(volume);
+            self.state.apply_volume(&sink);
         }
         Ok(())
     }
@@ -211,25 +357,46 @@ impl Drop for Media {
     }
 }
 
-fn open_output(state: &Arc<State>) -> io::Result<OutputStream> {
-    let callback_state = state.clone();
-    OutputStreamBuilder::from_default_device()
+fn open_output(output: &SharedOutput) -> io::Result<MixTarget> {
+    let mut endpoint = output.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(endpoint) = endpoint
+        .as_ref()
+        .filter(|endpoint| !endpoint.target.failed.load(Relaxed))
+    {
+        return Ok(endpoint.target.clone());
+    }
+    endpoint.take();
+    let failed = Arc::new(AtomicBool::new(false));
+    let callback_failed = failed.clone();
+    let mut stream = OutputStreamBuilder::from_default_device()
         .map_err(|error| io::Error::other(format!("获取音频设备失败：{error}")))?
         .with_error_callback(move |_| {
-            callback_state.device_failed.store(true, Relaxed);
+            callback_failed.store(true, Relaxed);
         })
         .open_stream_or_fallback()
-        .map_err(|error| io::Error::other(format!("打开音频设备失败：{error}")))
+        .map_err(|error| io::Error::other(format!("打开音频设备失败：{error}")))?;
+    stream.log_on_drop(false);
+    let target = MixTarget {
+        mixer: stream.mixer().clone(),
+        channels: stream.config().channel_count(),
+        rate: stream.config().sample_rate(),
+        failed,
+    };
+    *endpoint = Some(Endpoint {
+        _stream: stream,
+        target: target.clone(),
+    });
+    Ok(target)
 }
 
-fn recover_output(state: &Arc<State>) -> io::Result<OutputStream> {
+fn recover_output(state: &State, output: &SharedOutput) -> io::Result<MixTarget> {
     let mut last_error = None;
     // Allow USB/Bluetooth devices and Windows' default endpoint to settle.
     for _ in 0..30 {
         if state.stopped.load(Relaxed) {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "播放已停止"));
         }
-        match open_output(state) {
+        match open_output(output) {
             Ok(output) => return Ok(output),
             Err(error) => last_error = Some(error),
         }
@@ -241,7 +408,12 @@ fn recover_output(state: &Arc<State>) -> io::Result<OutputStream> {
     )))
 }
 
-fn play(url: url::Url, state: &Arc<State>, events: &Sender<MediaEvent>) -> io::Result<()> {
+fn play(
+    url: url::Url,
+    state: &Arc<State>,
+    events: &Sender<MediaEvent>,
+    output: &SharedOutput,
+) -> io::Result<()> {
     let failed = ReadFailure::default();
     let input = HttpAudio::open(url, failed.clone())
         .map_err(|error| io::Error::other(format!("读取音频失败：{error}")))?;
@@ -259,8 +431,8 @@ fn play(url: url::Url, state: &Arc<State>, events: &Sender<MediaEvent>) -> io::R
     if let Some(duration) = decoder.total_duration() {
         state.duration.store(duration.as_millis() as u64, Relaxed);
     }
-    let mut output = open_output(state)?;
-    let mut sink = state.make_sink(output.mixer());
+    let mut target = open_output(output)?;
+    let mut sink = state.make_sink(&target);
     let _ = events.send(MediaEvent::Opened);
     let mut next_us = 0;
     let mut eof = false;
@@ -268,7 +440,8 @@ fn play(url: url::Url, state: &Arc<State>, events: &Sender<MediaEvent>) -> io::R
     let mut recoveries = 0;
     let mut last_recovery = Instant::now();
     while !state.stopped.load(Relaxed) {
-        if state.device_failed.swap(false, Relaxed) {
+        if state.device_failed.swap(false, Relaxed) || target.failed.load(Relaxed) {
+            target.failed.store(true, Relaxed);
             if last_recovery.elapsed() >= Duration::from_secs(5) {
                 recoveries = 0;
             }
@@ -281,11 +454,8 @@ fn play(url: url::Url, state: &Arc<State>, events: &Sender<MediaEvent>) -> io::R
             last_recovery = Instant::now();
             state.recovering.store(true, Relaxed);
             sink.stop();
-            // Dispose of the invalid endpoint before opening the current default.
-            drop(output);
             let resume_us = state.position.load(Relaxed);
-            state.device_failed.store(false, Relaxed);
-            output = recover_output(state)?;
+            target = recover_output(state, output)?;
             if state.stopped.load(Relaxed) {
                 return Ok(());
             }
@@ -294,7 +464,7 @@ fn play(url: url::Url, state: &Arc<State>, events: &Sender<MediaEvent>) -> io::R
                 eof = false;
             }
             state.position.store(next_us, Relaxed);
-            sink = state.make_sink(output.mixer());
+            sink = state.make_sink(&target);
             analyzer.reset();
             state.recovering.store(false, Relaxed);
         }
@@ -303,7 +473,7 @@ fn play(url: url::Url, state: &Arc<State>, events: &Sender<MediaEvent>) -> io::R
             match seekable.then(|| decoder.try_seek(Duration::from_millis(request))) {
                 Some(Ok(())) => {
                     next_us = request.saturating_mul(1000);
-                    sink = state.make_sink(output.mixer());
+                    sink = state.make_sink(&target);
                     analyzer.reset();
                     state.position.store(next_us, Relaxed);
                     eof = false;
@@ -344,26 +514,50 @@ fn play(url: url::Url, state: &Arc<State>, events: &Sender<MediaEvent>) -> io::R
                 return Err(io::Error::other(format!("读取 NAS 音频中断：{reason}")));
             }
             if samples.is_empty() {
+                if next_us == 0 {
+                    return Err(io::Error::other("音频没有可播放的采样"));
+                }
                 eof = true;
+                let finished = state.finished.clone();
+                let generation = state.end_revision.clone();
+                let current = generation.load(Relaxed);
+                sink.append(rodio::source::EmptyCallback::new(Box::new(move || {
+                    if generation.load(Relaxed) == current {
+                        finished.store(true, Release);
+                    }
+                })));
             } else if !state.stopped.load(Relaxed) {
                 let samples_per_second = u64::from(channels) * u64::from(rate);
                 let length_us = samples.len() as u64 * 1_000_000 / samples_per_second;
+                let bands = if state.spectrum.enabled.load(Relaxed) {
+                    analyzer.analyze(&samples, channels, rate)
+                } else {
+                    analyzer.reset();
+                    [0.0; BANDS]
+                };
+                // All queued samples use the mixer format, including across the track boundary.
+                let samples = if channels == target.channels && rate == target.rate {
+                    samples
+                } else {
+                    rodio::source::UniformSourceIterator::new(
+                        rodio::buffer::SamplesBuffer::new(channels, rate, samples),
+                        target.channels,
+                        target.rate,
+                    )
+                    .collect()
+                };
                 sink.append(PlayedChunk {
-                    bands: if state.spectrum.enabled.load(Relaxed) {
-                        analyzer.analyze(&samples, channels, rate)
-                    } else {
-                        analyzer.reset();
-                        [0.0; BANDS]
-                    },
+                    bands,
                     spectrum: state.spectrum.clone(),
                     generation: state.spectrum.generation.load(Relaxed),
                     data: samples.into_iter(),
                     position: state.position.clone(),
-                    channels,
-                    rate,
+                    channels: target.channels,
+                    rate: target.rate,
                     base_us: next_us,
                     consumed: 0,
                 });
+                state.ready.store(true, Release);
                 next_us += length_us;
             }
         } else {
@@ -761,8 +955,72 @@ impl Seek for HttpAudio {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Router, extract::State, http::HeaderMap, response::IntoResponse, routing::get};
+    use axum::{
+        Router, extract::State as AxumState, http::HeaderMap, response::IntoResponse, routing::get,
+    };
     use std::sync::atomic::AtomicUsize;
+
+    fn playback_state(gate: Option<Arc<StartGate>>) -> State {
+        State {
+            gate,
+            playing: AtomicBool::new(true),
+            volume: AtomicU32::new(1.0f32.to_bits()),
+            gain: AtomicU32::new(1.0f32.to_bits()),
+            ..State::default()
+        }
+    }
+
+    #[test]
+    fn gapless_gate_releases_prepared_samples_at_the_preceding_sinks_tail() {
+        use rodio::{buffer::SamplesBuffer, mixer::mixer, source::EmptyCallback};
+        let (mixer, mut output) = mixer(2, 48_000);
+        let target = MixTarget {
+            mixer,
+            channels: 2,
+            rate: 48_000,
+            failed: Arc::default(),
+        };
+        let state = playback_state(None);
+        let current = state.make_sink(&target);
+        let tail = state.finished.clone();
+        current.append(SamplesBuffer::new(2, 48_000, vec![0.25; 8]));
+        current.append(EmptyCallback::new(Box::new(move || {
+            tail.store(true, Release)
+        })));
+        let next_state = playback_state(Some(Arc::new(StartGate {
+            predecessor: Some(state.finished.clone()),
+            ..StartGate::default()
+        })));
+        let next = next_state.make_sink(&target);
+        next.append(SamplesBuffer::new(2, 48_000, vec![0.5; 8]));
+        assert_eq!(output.by_ref().take(8).collect::<Vec<_>>(), vec![0.25; 8]);
+        assert_eq!(output.take(8).collect::<Vec<_>>(), vec![0.5; 8]);
+    }
+
+    #[test]
+    fn crossfade_gate_can_mix_both_sinks_without_consuming_the_head_early() {
+        use rodio::{buffer::SamplesBuffer, mixer::mixer};
+        let (mixer, mut output) = mixer(2, 48_000);
+        let target = MixTarget {
+            mixer,
+            channels: 2,
+            rate: 48_000,
+            failed: Arc::default(),
+        };
+        let state = playback_state(None);
+        let current = state.make_sink(&target);
+        current.append(SamplesBuffer::new(2, 48_000, vec![0.25; 8]));
+        let gate = Arc::new(StartGate::default());
+        let next_state = playback_state(Some(gate.clone()));
+        let next = next_state.make_sink(&target);
+        next.append(SamplesBuffer::new(2, 48_000, vec![0.5, 0.625, 0.75, 0.875]));
+        assert_eq!(output.by_ref().take(4).collect::<Vec<_>>(), vec![0.25; 4]);
+        gate.open.store(true, Release);
+        assert_eq!(
+            output.take(4).collect::<Vec<_>>(),
+            vec![0.75, 0.875, 1.0, 1.125]
+        );
+    }
 
     #[test]
     fn spectrum_is_published_at_consumption_and_old_chunks_cannot_restore_it_after_reset() {
@@ -1181,7 +1439,7 @@ mod tests {
                 .route(
                     "/track.wav",
                     get(
-                        |State(wav): State<Arc<Vec<u8>>>, headers: HeaderMap| async move {
+                        |AxumState(wav): AxumState<Arc<Vec<u8>>>, headers: HeaderMap| async move {
                             let range = headers[RANGE]
                                 .to_str()
                                 .unwrap()

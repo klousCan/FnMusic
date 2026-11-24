@@ -29,6 +29,7 @@ impl SpectrumView {
         enabled: bool,
         playing: bool,
         accent: Accent,
+        detail: bool,
     ) {
         if !enabled
             || ui
@@ -75,29 +76,42 @@ impl SpectrumView {
             }
             moving |= *level > 0.0;
         }
-        // Resample the measured bands at a steady spacing across the playback bar.
-        let count = (rect.width() / BAR_PITCH).round().max(1.0) as usize;
-        let pitch = rect.width() / count as f32;
-        let width = pitch - BAR_GAP.min(pitch * 0.35);
-        for index in 0..count {
-            let band = ((index as f32 + 0.5) * BANDS as f32 / count as f32 - 0.5)
-                .clamp(0.0, (BANDS - 1) as f32);
-            let lower = band.floor() as usize;
-            let upper = (lower + 1).min(BANDS - 1);
-            let level = egui::lerp(self.levels[lower]..=self.levels[upper], band.fract());
-            if level <= 0.005 {
-                continue;
-            }
-            let x = rect.left() + pitch * index as f32 + (pitch - width) * 0.5;
-            let bar = Rect::from_min_max(
-                egui::pos2(x, rect.bottom() - 2.0 - level * 28.0),
-                egui::pos2(x + width, rect.bottom() - 2.0),
-            );
-            painter.rect_filled(bar, 2, color.gamma_multiply(0.8 * (0.22 + level * 0.52)));
+        if moving {
+            let color = if detail {
+                color.gamma_multiply(0.30)
+            } else {
+                color
+            };
+            self.bars(&painter, rect, color, if detail { 68.0 } else { 28.0 });
         }
         if animated && (playing || moving) {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(33));
         }
+    }
+
+    fn bars(&self, painter: &egui::Painter, rect: Rect, color: Color32, height: f32) {
+        let count = (rect.width() / BAR_PITCH).round().max(1.0) as usize;
+        let pitch = rect.width() / count as f32;
+        let width = pitch - BAR_GAP.min(pitch * 0.35);
+        for index in 0..count {
+            let level = self.level((index as f32 + 0.5) / count as f32);
+            if level <= 0.005 {
+                continue;
+            }
+            let x = rect.left() + pitch * index as f32 + (pitch - width) * 0.5;
+            let bar = Rect::from_min_max(
+                egui::pos2(x, rect.bottom() - 2.0 - level * height),
+                egui::pos2(x + width, rect.bottom() - 2.0),
+            );
+            painter.rect_filled(bar, 2, color.gamma_multiply(0.8 * (0.22 + level * 0.52)));
+        }
+    }
+
+    fn level(&self, fraction: f32) -> f32 {
+        let band = (fraction * BANDS as f32 - 0.5).clamp(0.0, (BANDS - 1) as f32);
+        let lower = band.floor() as usize;
+        let upper = (lower + 1).min(BANDS - 1);
+        egui::lerp(self.levels[lower]..=self.levels[upper], band.fract())
     }
 }

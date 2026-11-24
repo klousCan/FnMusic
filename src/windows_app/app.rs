@@ -29,7 +29,7 @@ use super::{
     oauth::{Broker, Hooks},
     track_table::{Column, Table},
     updater,
-    vault::{self, Accent, ColorMode, Preferences, Vault},
+    vault::{self, Accent, ColorMode, Preferences, TrackTransition, Vault},
     widgets,
 };
 
@@ -56,6 +56,27 @@ struct Connection {
     session: Arc<Session>,
     queue_path: PathBuf,
     queue: Queue,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FailedTrack {
+    title: String,
+    reason: String,
+    attempts: u32,
+}
+
+struct PreparedNext {
+    index: usize,
+    track_id: String,
+    mode: TrackTransition,
+    address: String,
+    media: Media,
+}
+
+struct FadingTrack {
+    media: Media,
+    address: String,
+    duration_ms: u64,
 }
 
 enum Event {
@@ -199,6 +220,9 @@ pub struct MusicApp {
     preferences: Preferences,
     last_system_theme: Option<egui::Theme>,
     appearance_open: bool,
+    failed_tracks: HashMap<String, FailedTrack>,
+    failed_in_sequence: HashSet<String>,
+    failures_open: bool,
     exiting: bool,
     window_title: String,
     runtime: Runtime,
@@ -251,6 +275,10 @@ pub struct MusicApp {
     saved_at: Instant,
     dirty: bool,
     media: Option<Media>,
+    media_address: Option<String>,
+    prepared_next: Option<PreparedNext>,
+    fading_track: Option<FadingTrack>,
+    preload_failed: Option<(usize, String)>,
     media_open: bool,
     playing: bool,
     playback_quality: PlaybackQuality,
@@ -363,6 +391,12 @@ impl MusicApp {
     }
 
     fn save_appearance(&mut self, ctx: &egui::Context) {
+        self.save_preferences();
+        self.close_to_tray = self.preferences.close_to_tray;
+        self.apply_appearance(ctx);
+    }
+
+    fn save_preferences(&mut self) {
         if self.vault.save_preferences(&self.preferences).is_err() {
             self.notifications.error(
                 "外观设置保存失败",
@@ -371,8 +405,6 @@ impl MusicApp {
                 None,
             );
         }
-        self.close_to_tray = self.preferences.close_to_tray;
-        self.apply_appearance(ctx);
     }
 
     fn appearance_window(&mut self, ctx: &egui::Context) {
@@ -391,7 +423,7 @@ impl MusicApp {
             .resizable(false)
             .movable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .fixed_size(Vec2::new(536.0, 352.0))
+            .fixed_size(Vec2::new(536.0, 380.0))
             .frame(
                 Frame::window(&ctx.style())
                     .corner_radius(18)
@@ -477,6 +509,16 @@ impl MusicApp {
                     }
                 });
                 ui.add_space(12.0);
+                if ui
+                    .checkbox(
+                        &mut self.preferences.spectrum_in_lyrics,
+                        "在歌词详情背景显示频谱",
+                    )
+                    .changed()
+                {
+                    self.save_preferences();
+                }
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let rect = ui
                         .allocate_exact_size(Vec2::splat(18.0), egui::Sense::hover())
@@ -1070,6 +1112,9 @@ impl MusicApp {
             preferences: preferences.clone(),
             last_system_theme: None,
             appearance_open: false,
+            failed_tracks: HashMap::new(),
+            failed_in_sequence: HashSet::new(),
+            failures_open: false,
             exiting: false,
             window_title: String::new(),
             runtime,
@@ -1122,6 +1167,10 @@ impl MusicApp {
             saved_at: now,
             dirty: false,
             media: None,
+            media_address: None,
+            prepared_next: None,
+            fading_track: None,
+            preload_failed: None,
             media_open: false,
             playing: false,
             playback_quality: PlaybackQuality::Auto,
@@ -1280,6 +1329,9 @@ impl MusicApp {
     }
 
     fn disconnect(&mut self, explicit: bool) {
+        self.failed_tracks.clear();
+        self.failed_in_sequence.clear();
+        self.failures_open = false;
         self.notifications.clear();
         self.persist();
         self.daily_cache = None;
@@ -1826,6 +1878,11 @@ impl MusicApp {
                                 queue_path,
                                 queue,
                             } = *connection;
+                            self.failed_tracks =
+                                std::fs::read(self.vault.failed_tracks_file(&credentials))
+                                    .ok()
+                                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                                    .unwrap_or_default();
                             self.session_epoch += 1;
                             self.daily_cache = None;
                             self.daily_day = daily::today();
@@ -2092,6 +2149,7 @@ impl MusicApp {
     }
 
     fn track_changed(&mut self, playing: bool) {
+        self.failed_in_sequence.clear();
         self.stop_media();
         self.request_lyrics();
         self.dirty = true;
@@ -2103,6 +2161,10 @@ impl MusicApp {
     fn stop_media(&mut self) {
         self.relay.revoke();
         self.media = None;
+        self.media_address = None;
+        self.prepared_next = None;
+        self.fading_track = None;
+        self.preload_failed = None;
         self.media_open = false;
         self.playing = false;
         self.seek_preview = None;
@@ -2120,8 +2182,12 @@ impl MusicApp {
         );
         match Media::open(&address, self.queue.volume) {
             Ok(media) => {
-                media.set_spectrum_enabled(self.preferences.show_spectrum && !self.lyrics_detail);
+                media.set_spectrum_enabled(
+                    self.preferences.show_spectrum
+                        && (!self.lyrics_detail || self.preferences.spectrum_in_lyrics),
+                );
                 self.media = Some(media);
+                self.media_address = Some(address);
                 self.media_open = false;
                 self.playing = true;
             }
@@ -2150,6 +2216,106 @@ impl MusicApp {
         );
     }
 
+    fn on_track_error(&mut self, reason: &str) {
+        let global = reason.contains("设备")
+            || ["HTTP 401", "HTTP 403", "HTTP 429", "HTTP 5"]
+                .iter()
+                .any(|status| reason.contains(status))
+            || reason.contains("连接音频服务失败");
+        if global {
+            self.media_failed(reason);
+            return;
+        }
+
+        let Some(track) = self.queue.current() else {
+            self.media_failed(reason);
+            return;
+        };
+        let title = track.title.clone();
+        let record = self
+            .failed_tracks
+            .entry(track.id.clone())
+            .or_insert_with(|| FailedTrack {
+                title: title.clone(),
+                reason: String::new(),
+                attempts: 0,
+            });
+        record.reason = reason.into();
+        record.attempts = record.attempts.saturating_add(1);
+        self.failed_in_sequence.insert(track.id.clone());
+        self.save_failed_tracks();
+
+        if self.preferences.skip_failed_tracks
+            && self.playing
+            && !matches!(self.sleep_timer, SleepTimer::EndOfTrack)
+            && self.queue.skip_failed(&self.failed_in_sequence)
+        {
+            self.stop_media();
+            self.request_lyrics();
+            self.dirty = true;
+            self.notifications
+                .error("已跳过播放失败的歌曲", &title, reason, None);
+            self.open_media();
+        } else {
+            self.media_failed(reason);
+        }
+    }
+
+    fn save_failed_tracks(&mut self) {
+        if let Some(credentials) = &self.saved {
+            let result = serde_json::to_vec(&self.failed_tracks)
+                .map_err(std::io::Error::other)
+                .and_then(|bytes| {
+                    fnmusic::storage::replace(&self.vault.failed_tracks_file(credentials), &bytes)
+                });
+            if let Err(error) = result {
+                self.notifications.error(
+                    "播放失败记录未保存",
+                    "请检查本地存储。",
+                    error.to_string(),
+                    None,
+                );
+            }
+        }
+    }
+
+    fn failures_window(&mut self, ctx: &egui::Context) {
+        if !self.failures_open {
+            return;
+        }
+        let mut clear = false;
+        egui::Window::new("播放失败记录")
+            .open(&mut self.failures_open)
+            .default_width(440.0)
+            .show(ctx, |ui| {
+                if self.failed_tracks.is_empty() {
+                    ui.label("暂无记录");
+                    return;
+                }
+                clear = ui.button("清除记录").clicked();
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        let mut records: Vec<_> = self.failed_tracks.values().collect();
+                        records.sort_by(|a, b| a.title.cmp(&b.title));
+                        for record in records {
+                            ui.collapsing(
+                                format!("{} · {} 次", record.title, record.attempts),
+                                |ui| {
+                                    ui.add(
+                                        egui::Label::new(&record.reason).wrap().selectable(true),
+                                    );
+                                },
+                            );
+                        }
+                    });
+            });
+        if clear {
+            self.failed_tracks.clear();
+            self.save_failed_tracks();
+        }
+    }
+
     fn set_playback_quality(&mut self, quality: PlaybackQuality) {
         if self.playback_quality == quality {
             return;
@@ -2171,6 +2337,9 @@ impl MusicApp {
             return;
         }
         self.playing = !self.playing;
+        if let Some(fading) = &self.fading_track {
+            let _ = fading.media.set_playing(self.playing);
+        }
         if self.media_open
             && let Some(media) = &self.media
             && let Err(error) = media.set_playing(self.playing)
@@ -2202,6 +2371,8 @@ impl MusicApp {
 
     fn pause_for_sleep(&mut self) {
         self.playing = false;
+        self.cancel_preload();
+        self.finish_fade();
         if let Some(media) = &self.media
             && self.media_open
             && media.set_playing(false).is_err()
@@ -2323,10 +2494,52 @@ impl MusicApp {
             self.dirty = true;
         }
         ui.separator();
+        widgets::submenu(ui, Icon::Next, "曲目衔接", |ui| {
+            widgets::menu(ui, "曲目衔接");
+            for (mode, label) in [
+                (TrackTransition::Off, "关闭"),
+                (TrackTransition::Gapless, "无缝播放"),
+                (TrackTransition::Crossfade, "交叉淡入淡出 · 5 秒"),
+            ] {
+                if widgets::action(
+                    ui,
+                    Icon::Music,
+                    label,
+                    None,
+                    widgets::Row::Selected(self.preferences.track_transition == mode),
+                )
+                .clicked()
+                {
+                    self.preferences.track_transition = mode;
+                    self.save_preferences();
+                    ui.close_menu();
+                }
+            }
+        });
+        if widgets::action(
+            ui,
+            Icon::Next,
+            "自动跳过播放失败的歌曲",
+            None,
+            widgets::Row::Toggle(self.preferences.skip_failed_tracks),
+        )
+        .clicked()
+        {
+            self.preferences.skip_failed_tracks = !self.preferences.skip_failed_tracks;
+            self.failed_in_sequence.clear();
+            self.save_preferences();
+        }
+        if widgets::action(ui, Icon::More, "播放失败记录", None, widgets::Row::Action).clicked()
+        {
+            self.failures_open = true;
+            ui.close_menu();
+        }
         self.sleep_menu(ui);
     }
 
     fn seek(&mut self, position: u64) {
+        self.cancel_preload();
+        self.finish_fade();
         self.queue.position_ms = position;
         self.dirty = true;
         if self.media_open
@@ -2356,7 +2569,7 @@ impl MusicApp {
         if let Some(media) = &self.media {
             media.set_spectrum_enabled(
                 self.preferences.show_spectrum
-                    && !self.lyrics_detail
+                    && (!self.lyrics_detail || self.preferences.spectrum_in_lyrics)
                     && !self
                         .events
                         .ctx
@@ -2367,6 +2580,7 @@ impl MusicApp {
         if sleep_expired {
             self.pause_for_sleep();
         }
+        self.update_transition();
         while let Some(event) = self.media.as_ref().and_then(Media::event) {
             match event {
                 MediaEvent::Opened => {
@@ -2385,11 +2599,11 @@ impl MusicApp {
                         self.stop_media();
                         self.queue.position_ms = 0;
                         self.dirty = true;
-                    } else if !sleep_expired {
+                    } else if !sleep_expired && !self.promote_next(0) {
                         self.next_track(true);
                     }
                 }
-                MediaEvent::Failed(reason) => self.media_failed(&reason),
+                MediaEvent::Failed(reason) => self.on_track_error(&reason),
                 MediaEvent::SeekFailed => {
                     self.position_hold = Instant::now();
                     self.notifications.error(
@@ -2409,6 +2623,171 @@ impl MusicApp {
             self.dirty |= self.queue.position_ms != position;
             self.queue.position_ms = position;
         }
+    }
+
+    fn cancel_preload(&mut self) {
+        if let Some(prepared) = self.prepared_next.take() {
+            self.relay.release(&prepared.address);
+        }
+    }
+
+    fn finish_fade(&mut self) {
+        if let Some(old) = self.fading_track.take() {
+            self.relay.release(&old.address);
+            if let Some(media) = &self.media {
+                media.set_gain(1.0);
+            }
+        }
+    }
+
+    fn update_transition(&mut self) {
+        if let Some(fading) = &self.fading_track {
+            if let Some(media) = &self.media {
+                let t = (media.position().unwrap_or(0) as f32 / fading.duration_ms as f32)
+                    .clamp(0.0, 1.0);
+                let theta = t * std::f32::consts::FRAC_PI_2;
+                media.set_gain(theta.sin());
+                fading.media.set_gain(theta.cos());
+                if t >= 1.0
+                    || matches!(
+                        fading.media.event(),
+                        Some(MediaEvent::Ended | MediaEvent::Failed(_))
+                    )
+                {
+                    self.finish_fade();
+                } else if self.playing {
+                    self.events
+                        .ctx
+                        .request_repaint_after(Duration::from_millis(16));
+                }
+            }
+            return;
+        }
+        let mode = self.preferences.track_transition;
+        let candidate = if mode != TrackTransition::Off
+            && !matches!(self.sleep_timer, SleepTimer::EndOfTrack)
+        {
+            self.queue
+                .next_candidate()
+                .map(|(index, track)| (index, track.clone()))
+        } else {
+            None
+        };
+        if self.prepared_next.as_ref().is_some_and(|next| {
+            next.mode != mode
+                || candidate
+                    .as_ref()
+                    .is_none_or(|(index, track)| *index != next.index || track.id != next.track_id)
+        }) {
+            self.cancel_preload();
+        }
+        if let Some(next) = &self.prepared_next {
+            while let Some(event) = next.media.event() {
+                if matches!(event, MediaEvent::Failed(_) | MediaEvent::Ended) {
+                    self.preload_failed = Some((next.index, next.track_id.clone()));
+                    self.cancel_preload();
+                    break;
+                }
+            }
+        }
+        let (Some((index, track)), Some(session), Some(media)) =
+            (candidate, self.session.clone(), &self.media)
+        else {
+            return;
+        };
+        if !self.playing || !self.media_open || self.seek_preview.is_some() {
+            return;
+        }
+        let duration = self.duration();
+        let Some(position) = media.position() else {
+            return;
+        };
+        let remaining = duration.saturating_sub(position);
+        if duration > 0
+            && remaining <= 12_000
+            && self.prepared_next.is_none()
+            && self
+                .preload_failed
+                .as_ref()
+                .is_none_or(|(failed_index, id)| *failed_index != index || *id != track.id)
+        {
+            let address = self.relay.issue_additional(
+                session,
+                track.id.clone(),
+                &track.format,
+                self.playback_quality.parameter(),
+            );
+            match media.prepare(
+                &address,
+                self.queue.volume,
+                mode == TrackTransition::Gapless,
+            ) {
+                Ok(next) => {
+                    self.prepared_next = Some(PreparedNext {
+                        index,
+                        track_id: track.id.clone(),
+                        mode,
+                        address,
+                        media: next,
+                    })
+                }
+                Err(_) => {
+                    self.relay.release(&address);
+                    self.preload_failed = Some((index, track.id.clone()));
+                }
+            }
+        }
+        let fade = 5_000.min(duration / 2).min(if track.duration_ms > 0 {
+            track.duration_ms / 2
+        } else {
+            5_000
+        });
+        if mode == TrackTransition::Crossfade
+            && remaining <= fade
+            && remaining >= 150
+            && self
+                .prepared_next
+                .as_ref()
+                .is_some_and(|next| next.media.ready())
+        {
+            self.promote_next(remaining);
+        }
+    }
+
+    fn promote_next(&mut self, fade_ms: u64) -> bool {
+        let Some(prepared) = &self.prepared_next else {
+            return false;
+        };
+        if !prepared.media.ready() {
+            // A slow or failed preload uses the regular next-track path.
+            return false;
+        }
+        let next = self.prepared_next.take().unwrap();
+        let old = self.media.replace(next.media);
+        let old_address = self.media_address.replace(next.address);
+        self.queue.select(next.index);
+        self.request_lyrics();
+        self.dirty = true;
+        self.media_open = true;
+        self.playing = true;
+        self.preload_failed = None;
+        self.position_hold = Instant::now();
+        if let (Some(media), Some(address)) = (old, old_address) {
+            if fade_ms > 0 {
+                self.fading_track = Some(FadingTrack {
+                    media,
+                    address,
+                    duration_ms: fade_ms,
+                });
+            } else {
+                self.relay.release(&address);
+            }
+        }
+        if let Some(media) = &self.media {
+            media.set_gain(if fade_ms > 0 { 0.0 } else { 1.0 });
+            media.activate();
+        }
+        true
     }
 
     fn persist(&mut self) {
@@ -3569,6 +3948,7 @@ impl MusicApp {
                     self.preferences.show_spectrum,
                     self.playing,
                     self.preferences.accent,
+                    false,
                 );
                 const TRANSPORT_WIDTH: f32 = 4.0 * 32.0 + 44.0 + 4.0 * 6.0;
                 let (header, _) = ui.allocate_exact_size(
@@ -3803,6 +4183,12 @@ impl MusicApp {
         if let Some(media) = &self.media {
             let _ = media.volume(volume);
         }
+        if let Some(prepared) = &self.prepared_next {
+            let _ = prepared.media.volume(volume);
+        }
+        if let Some(fading) = &self.fading_track {
+            let _ = fading.media.volume(volume);
+        }
         self.dirty = true;
     }
 
@@ -3950,6 +4336,22 @@ impl MusicApp {
                     .inner_margin(egui::Margin::symmetric(64, 30)),
             )
             .show(ctx, |ui| {
+                if self.preferences.show_spectrum && self.preferences.spectrum_in_lyrics {
+                    let levels = self
+                        .media
+                        .as_ref()
+                        .map(Media::spectrum)
+                        .unwrap_or([0.0; fnmusic::spectrum::BANDS]);
+                    self.spectrum_view.paint(
+                        ui,
+                        ui.max_rect().expand2(egui::vec2(64.0, 30.0)),
+                        levels,
+                        true,
+                        self.playing,
+                        self.preferences.accent,
+                        true,
+                    );
+                }
                 ui.set_opacity(super::motion::reveal(
                     ctx,
                     egui::Id::new("detail-reveal"),
@@ -4598,6 +5000,7 @@ impl eframe::App for MusicApp {
         self.update_desktop(ctx);
         self.title_bar(ctx);
         self.appearance_window(ctx);
+        self.failures_window(ctx);
         self.update_window(ctx);
         if !self.exiting
             && !self.logging_out

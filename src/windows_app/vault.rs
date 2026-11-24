@@ -55,17 +55,27 @@ pub enum AnimationMode {
     Off,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackTransition {
+    #[default]
+    Off,
+    Gapless,
+    Crossfade,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Preferences {
     pub auto_check_updates: bool,
     pub show_spectrum: bool,
+    pub spectrum_in_lyrics: bool,
+    pub track_transition: TrackTransition,
+    pub skip_failed_tracks: bool,
     pub animation_mode: AnimationMode,
     pub close_to_tray: bool,
     pub color_mode: ColorMode,
     pub accent: Accent,
-    pub wallpaper_path: Option<PathBuf>,
-    pub wallpaper_opacity: f32,
 }
 
 impl Default for Preferences {
@@ -73,12 +83,13 @@ impl Default for Preferences {
         Self {
             auto_check_updates: true,
             show_spectrum: true,
+            spectrum_in_lyrics: false,
+            track_transition: TrackTransition::Off,
+            skip_failed_tracks: false,
             animation_mode: AnimationMode::On,
             close_to_tray: true,
             color_mode: ColorMode::System,
             accent: Accent::Red,
-            wallpaper_path: None,
-            wallpaper_opacity: 0.18,
         }
     }
 }
@@ -189,6 +200,12 @@ impl Vault {
             .join(format!("{}.json", Self::account_key(session)))
     }
 
+    pub fn failed_tracks_file(&self, session: &Credentials) -> PathBuf {
+        self.root
+            .join("failed-tracks")
+            .join(format!("{}.json", Self::account_key(session)))
+    }
+
     fn account_key(session: &Credentials) -> String {
         let mut digest = Sha256::new();
         if let Some(id) = &session.fn_id {
@@ -272,7 +289,6 @@ mod tests {
         assert!(preferences.show_spectrum);
         assert_eq!(preferences.color_mode, super::ColorMode::System);
         assert_eq!(preferences.accent, super::Accent::Red);
-        assert!(preferences.wallpaper_path.is_none());
     }
 
     #[test]

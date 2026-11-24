@@ -25,7 +25,7 @@ struct Lease {
     stop: CancellationToken,
 }
 
-type Active = Arc<Mutex<Option<Lease>>>;
+type Active = Arc<Mutex<Vec<Lease>>>;
 
 pub struct Relay {
     address: SocketAddr,
@@ -61,6 +61,17 @@ impl Relay {
         format: &str,
         quality: Option<&str>,
     ) -> String {
+        self.revoke();
+        self.issue_additional(session, track_id, format, quality)
+    }
+
+    pub fn issue_additional(
+        &self,
+        session: Arc<Session>,
+        track_id: String,
+        format: &str,
+        quality: Option<&str>,
+    ) -> String {
         let key = random_id();
         let suffix = match format {
             "MP3" => "mp3",
@@ -77,16 +88,28 @@ impl Relay {
             session,
             stop: CancellationToken::new(),
         };
-        if let Some(previous) = lock(&self.active).replace(lease) {
-            previous.stop.cancel();
-        }
+        lock(&self.active).push(lease);
         format!("http://{}/audio/{key}/track.{suffix}", self.address)
     }
 
     pub fn revoke(&self) {
-        if let Some(lease) = lock(&self.active).take() {
+        for lease in lock(&self.active).drain(..) {
             lease.stop.cancel();
         }
+    }
+
+    pub fn release(&self, address: &str) {
+        let Some(key) = address.split('/').nth(4) else {
+            return;
+        };
+        lock(&self.active).retain(|lease| {
+            if lease.key == key {
+                lease.stop.cancel();
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
@@ -97,7 +120,7 @@ impl Drop for Relay {
     }
 }
 
-fn lock(active: &Active) -> MutexGuard<'_, Option<Lease>> {
+fn lock(active: &Active) -> MutexGuard<'_, Vec<Lease>> {
     active.lock().unwrap_or_else(|err| err.into_inner())
 }
 
@@ -107,10 +130,7 @@ async fn serve(
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let lease = lock(&active)
-        .as_ref()
-        .filter(|lease| lease.key == key)
-        .cloned();
+    let lease = lock(&active).iter().find(|lease| lease.key == key).cloned();
     let Some(lease) = lease else {
         return StatusCode::NOT_FOUND.into_response();
     };

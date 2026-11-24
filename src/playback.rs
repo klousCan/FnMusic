@@ -226,6 +226,43 @@ impl Queue {
             false
         }
     }
+
+    pub fn next_candidate(&self) -> Option<(usize, &Track)> {
+        let cursor = self.cursor()?;
+        if self.repeat == Repeat::One {
+            return Some((self.current?, self.current()?));
+        }
+        let index = self.order.get(cursor + 1).copied().or_else(|| {
+            // A shuffled repeat cycle chooses its first track only at the boundary.
+            (self.repeat == Repeat::All && !self.shuffle)
+                .then(|| self.order.first().copied())
+                .flatten()
+        })?;
+        Some((index, &self.tracks[index]))
+    }
+
+    pub fn skip_failed(&mut self, failed: &std::collections::HashSet<String>) -> bool {
+        let Some(cursor) = self.cursor() else {
+            return false;
+        };
+        let remaining = &self.order[cursor + 1..];
+        let wrap = if self.repeat == Repeat::All {
+            &self.order[..cursor]
+        } else {
+            &[]
+        };
+        if let Some(index) = remaining
+            .iter()
+            .chain(wrap)
+            .copied()
+            .find(|&index| !failed.contains(&self.tracks[index].id))
+        {
+            self.select(index);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -314,6 +351,28 @@ pub fn active_lyric(lines: &[LyricLine], ms: u64) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skipping_bad_tracks_handles_repeat_modes_without_looping() {
+        let mut queue = Queue::default();
+        let tracks = ["a", "b", "a", "c"]
+            .map(|id| Track {
+                id: id.into(),
+                ..Default::default()
+            })
+            .to_vec();
+        queue.replace(tracks, 0);
+        queue.repeat = Repeat::One;
+        assert_eq!(queue.next_candidate().unwrap().1.id, "a");
+        assert!(queue.skip_failed(&["a".into()].into_iter().collect()));
+        assert_eq!(queue.current().unwrap().id, "b");
+        queue.repeat = Repeat::All;
+        assert!(queue.skip_failed(&["a".into(), "b".into()].into_iter().collect()));
+        assert_eq!(queue.current().unwrap().id, "c");
+        queue.position_ms = 42;
+        assert!(!queue.skip_failed(&["a".into(), "b".into(), "c".into()].into_iter().collect()));
+        assert_eq!(queue.position_ms, 42);
+    }
 
     #[test]
     fn clear_after_playback_waits_for_natural_end_and_preserves_settings() {
