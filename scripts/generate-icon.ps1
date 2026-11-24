@@ -1,61 +1,76 @@
+param(
+    [string]$SourcePng
+)
+
+$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
-$root = Split-Path $PSScriptRoot -Parent
-$assetDir = Join-Path $root 'assets'
-[IO.Directory]::CreateDirectory($assetDir) | Out-Null
-$images = @()
-foreach ($size in @(16, 24, 32, 48, 64, 128, 256)) {
-    $bitmap = [Drawing.Bitmap]::new($size, $size)
-    $g = [Drawing.Graphics]::FromImage($bitmap)
-    $g.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $g.ScaleTransform($size / 256.0, $size / 256.0)
-    $path = [Drawing.Drawing2D.GraphicsPath]::new()
-    $path.AddArc(8,8,128,128,180,90)
-    $path.AddArc(120,8,128,128,270,90)
-    $path.AddArc(120,120,128,128,0,90)
-    $path.AddArc(8,120,128,128,90,90)
-    $path.CloseFigure()
-    $brush = [Drawing.SolidBrush]::new([Drawing.ColorTranslator]::FromHtml('#FAF8F3'))
-    $g.FillPath($brush,$path)
-    $border = [Drawing.Pen]::new([Drawing.ColorTranslator]::FromHtml('#2A2A2A'),6)
-    $g.DrawPath($border,$path)
-    $border.Dispose()
-    # Centre the painted SVG bounds (approximately 25,24), not its
-    # asymmetric viewBox, within the square application-icon tile.
-    $g.TranslateTransform(128,128)
-    $g.ScaleTransform(4.7,4.7)
-    $g.TranslateTransform(-25,-24)
-    $pen = [Drawing.Pen]::new([Drawing.ColorTranslator]::FromHtml('#2A2A2A'),3.5)
-    $pen.StartCap = $pen.EndCap = [Drawing.Drawing2D.LineCap]::Round
-    $note = [Drawing.SolidBrush]::new([Drawing.ColorTranslator]::FromHtml('#E76F51'))
-    foreach ($center in @(@(16,32),@(34,28))) {
-        $state = $g.Save()
-        $g.TranslateTransform($center[0],$center[1])
-        $g.RotateTransform(-15)
-        $g.FillEllipse($note,-8,-6,16,12)
-        $g.DrawEllipse($pen,-8,-6,16,12)
-        $g.Restore($state)
-    }
-    $pen.Width = 3
-    $g.DrawLine($pen,22,14,40,10)
-    $g.DrawLine($pen,40,10,40,28)
-    $note.Dispose()
+$assetDir = Join-Path (Split-Path $PSScriptRoot -Parent) 'assets'
+$appIcon = Join-Path $assetDir 'icon.png'
+
+function ConvertTo-IconPng([Drawing.Bitmap]$Source, [int]$Size) {
+    $bitmap = [Drawing.Bitmap]::new($Size, $Size, [Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    $graphics = [Drawing.Graphics]::FromImage($bitmap)
     $memory = [IO.MemoryStream]::new()
-    $bitmap.Save($memory,[Drawing.Imaging.ImageFormat]::Png)
-    $images += ,@{Size=$size;Bytes=$memory.ToArray()}
-    if ($size -eq 256) { [IO.File]::WriteAllBytes((Join-Path $assetDir 'icon.png'),$memory.ToArray()) }
-    $memory.Dispose(); $pen.Dispose(); $brush.Dispose(); $path.Dispose(); $g.Dispose(); $bitmap.Dispose()
+    try {
+        $graphics.CompositingMode = [Drawing.Drawing2D.CompositingMode]::SourceCopy
+        $graphics.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $graphics.PixelOffsetMode = [Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        $graphics.DrawImage($Source, [Drawing.Rectangle]::new(0, 0, $Size, $Size))
+        $bitmap.Save($memory, [Drawing.Imaging.ImageFormat]::Png)
+        return ,$memory.ToArray()
+    } finally {
+        $memory.Dispose()
+        $graphics.Dispose()
+        $bitmap.Dispose()
+    }
 }
+
+if ($SourcePng) {
+    $source = [Drawing.Bitmap]::new((Resolve-Path -LiteralPath $SourcePng).Path)
+    try {
+        if ($source.Width -ne $source.Height -or $source.Width -lt 256) {
+            throw 'The source icon must be square and at least 256 pixels wide.'
+        }
+        [byte[]]$png = ConvertTo-IconPng $source 256
+    } finally {
+        $source.Dispose()
+    }
+    [IO.File]::WriteAllBytes($appIcon, $png)
+}
+
+$source = [Drawing.Bitmap]::new($appIcon)
+try {
+    $images = foreach ($size in @(16, 24, 32, 48, 64, 128, 256)) {
+        $bytes = if ($size -eq 256) { [IO.File]::ReadAllBytes($appIcon) } else { ConvertTo-IconPng $source $size }
+        @{ Size = $size; Bytes = [byte[]]$bytes }
+    }
+} finally {
+    $source.Dispose()
+}
+
 $stream = [IO.MemoryStream]::new()
 $writer = [IO.BinaryWriter]::new($stream)
-$writer.Write([uint16]0); $writer.Write([uint16]1); $writer.Write([uint16]$images.Count)
-$offset = 6 + 16 * $images.Count
-foreach ($entry in $images) {
-    $dimension = if ($entry.Size -eq 256) { 0 } else { $entry.Size }
-    $writer.Write([byte]$dimension); $writer.Write([byte]$dimension)
-    $writer.Write([uint16]0); $writer.Write([uint16]1); $writer.Write([uint16]32)
-    $writer.Write([uint32]$entry.Bytes.Length); $writer.Write([uint32]$offset)
-    $offset += $entry.Bytes.Length
+try {
+    $writer.Write([uint16]0)
+    $writer.Write([uint16]1)
+    $writer.Write([uint16]$images.Count)
+    $offset = 6 + 16 * $images.Count
+    foreach ($entry in $images) {
+        $dimension = if ($entry.Size -eq 256) { 0 } else { $entry.Size }
+        $writer.Write([byte]$dimension)
+        $writer.Write([byte]$dimension)
+        $writer.Write([uint16]0)
+        $writer.Write([uint16]1)
+        $writer.Write([uint16]32)
+        $writer.Write([uint32]$entry.Bytes.Length)
+        $writer.Write([uint32]$offset)
+        $offset += $entry.Bytes.Length
+    }
+    foreach ($entry in $images) {
+        $writer.Write($entry.Bytes)
+    }
+    [IO.File]::WriteAllBytes((Join-Path $assetDir 'icon.ico'), $stream.ToArray())
+} finally {
+    $writer.Dispose()
+    $stream.Dispose()
 }
-foreach ($entry in $images) { $writer.Write([byte[]]$entry.Bytes) }
-[IO.File]::WriteAllBytes((Join-Path $assetDir 'icon.ico'),$stream.ToArray())
-$writer.Dispose(); $stream.Dispose()

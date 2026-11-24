@@ -2455,7 +2455,7 @@ impl MusicApp {
             ui.vertical_centered(|ui| {
                 ui.add_space((ui.available_height() * 0.22).max(20.0));
                 let (rect, _) = ui.allocate_exact_size(artwork::square(72.0), egui::Sense::hover());
-                artwork::paint(ui, rect, None, "FnMusic");
+                icons::app_logo(ui, rect);
                 ui.add_space(16.0);
                 ui.label(RichText::new("飞牛音乐").size(36.0).strong());
                 ui.label(RichText::new("连接你的 NAS，播放自己的音乐资料库").weak());
@@ -3568,6 +3568,7 @@ impl MusicApp {
                     levels,
                     self.preferences.show_spectrum,
                     self.playing,
+                    self.preferences.accent,
                 );
                 const TRANSPORT_WIDTH: f32 = 4.0 * 32.0 + 44.0 + 4.0 * 6.0;
                 let (header, _) = ui.allocate_exact_size(
